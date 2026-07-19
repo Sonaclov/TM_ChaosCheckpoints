@@ -35,11 +35,14 @@ Every extra can be toggled or tuned individually from the match settings:
 ```
 Scripts/Modes/TrackMania/ChaosCheckpoints.Script.txt   The game mode (ManiaScript)
 MatchSettings/ChaosCheckpoints.txt                     Example match settings
+DEPLOYMENT.md                                          Full deployment manual
 ```
 
 The layout mirrors the dedicated server's `UserData/` folder so you can copy it over 1:1.
 
 ## Installation (dedicated server)
+
+> Short version below — for a complete walkthrough (server account, config, systemd service, firewall, verification, troubleshooting) see **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
 1. Download the [Trackmania dedicated server](https://doc.trackmania.com/dedicated-server/) and set up your accounts as usual.
 2. Copy the files into the server's `UserData/` folder:
