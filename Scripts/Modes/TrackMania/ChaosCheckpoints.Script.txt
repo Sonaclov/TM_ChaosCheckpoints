@@ -32,7 +32,7 @@
 #Extends "Modes/Nadeo/Trackmania/Base/TrackmaniaBase.Script.txt"
 
 #Const CompatibleMapTypes "TrackMania\\TM_Race,TM_Race"
-#Const Version "1.1.0"
+#Const Version "1.1.1"
 #Const ScriptName "Modes/TrackMania/ChaosCheckpoints.Script.txt"
 
 #Include "MathLib" as ML
@@ -87,380 +87,28 @@
 }
 
 // ---------------------------------- //
-// Globals
-// ---------------------------------- //
-declare K_ChaosCP[] G_ActiveCPs;			// Currently claimable chaos checkpoints
-declare Integer[] G_CandidateLandmarks;		// Indexes into MapLandmarks usable as locations
-declare Integer G_RoundEndTime;				// Server time at which the round ends
-declare Integer G_RoundNb;					// Current round number on this map
-declare Integer[Text] G_RespawnAt;			// Login => time at which to respawn the player
-declare Boolean G_RoundEndRequested;		// A player reached the points limit / won overtime
-declare CUILayer G_HudLayer;				// Custom HUD (timer + standings)
-
-// Optional extras state
-declare Integer[Text] G_LastClaimTime;		// Login => time of their latest claim (combos)
-declare Integer[Text] G_ComboCount;			// Login => current chain length (combos)
-declare Boolean G_FirstClaimDone;			// First-claim bonus already awarded this round
-declare Boolean G_FrenzyActive;				// Frenzy finale is running
-declare Integer G_NextShuffleTime;			// Next scheduled checkpoint shuffle
-declare Boolean G_InOvertime;				// Sudden-death overtime is running
-declare Integer G_OvertimeEndTime;			// Hard end of overtime
-
-// ---------------------------------- //
-// Small helpers around tunable settings
-// ---------------------------------- //
-Integer GetRoundTimeLimitMs() {
-	// Fast rounds by design: clamp between 1 and 10 minutes
-	return ML::Clamp(S_RoundTimeLimit, 60, 600) * 1000;
-}
-
-Integer GetNbChaosCheckpoints() {
-	// Frenzy finale runs one extra checkpoint
-	declare Nb = ML::Clamp(S_NbChaosCheckpoints, 1, 8);
-	if (G_FrenzyActive) Nb += 1;
-	return Nb;
-}
-
-// ---------------------------------- //
-/** Chat announcement (respects S_ChatMessages)
- */
-Void Chat(Text _Message) {
-	if (!S_ChatMessages) return;
-	UIManager.UIAll.SendChat("$ff0⚡ $fff" ^ _Message);
-}
-
-// ---------------------------------- //
-/** Big on-screen announcement, always shown
- */
-Void Announce(Text _Message) {
-	UIManager.UIAll.QueueMessage(3000, 1, CUIConfig::EMessageDisplay::Big, _Message);
-}
-
-// ---------------------------------- //
-// Score helpers
+// Persistent state
 //
-// All interactions with the Scores library are centralized here so the mode
-// is easy to adjust if the library API changes between script pack versions.
+// The dedicated server's script compiler rejects file-scope globals in a
+// mode extension (syntax error at end of file), so every piece of
+// cross-tick state is attached to the mode object with `declare ... for
+// This` and re-declared locally by each function or label that uses it:
+//
+//	K_ChaosCP[] G_ActiveCPs			Currently claimable chaos checkpoints
+//	Integer[] G_CandidateLandmarks	Indexes into MapLandmarks usable as locations
+//	Integer G_RoundEndTime			Server time at which the round ends
+//	Integer G_RoundNb				Current round number on this map
+//	Integer[Text] G_RespawnAt		Login => time at which to respawn the player
+//	Boolean G_RoundEndRequested		A player reached the points limit / won overtime
+//	Ident G_HudLayerId				Custom HUD layer (timer + standings)
+//	Integer[Text] G_LastClaimTime	Login => time of their latest claim (combos)
+//	Integer[Text] G_ComboCount		Login => current chain length (combos)
+//	Boolean G_FirstClaimDone		First-claim bonus already awarded this round
+//	Boolean G_FrenzyActive			Frenzy finale is running
+//	Integer G_NextShuffleTime		Next scheduled checkpoint shuffle
+//	Boolean G_InOvertime			Sudden-death overtime is running
+//	Integer G_OvertimeEndTime		Hard end of overtime
 // ---------------------------------- //
-Void ResetRoundPoints() {
-	foreach (Score in Scores) {
-		Scores::SetPlayerRoundPoints(Score, 0);
-	}
-}
-
-Void AddRoundPoints(CSmScore _Score, Integer _Points) {
-	if (_Score == Null) return;
-	Scores::AddPlayerRoundPoints(_Score, _Points);
-}
-
-Void SetRoundPoints(CSmScore _Score, Integer _Points) {
-	if (_Score == Null) return;
-	Scores::SetPlayerRoundPoints(_Score, _Points);
-}
-
-Integer GetRoundPoints(CSmScore _Score) {
-	if (_Score == Null) return 0;
-	return Scores::GetPlayerRoundPoints(_Score);
-}
-
-Integer GetMatchPoints(CSmScore _Score) {
-	if (_Score == Null) return 0;
-	return Scores::GetPlayerMatchPoints(_Score);
-}
-
-// Move this round's points into the match total
-Void TransferRoundPointsToMatch() {
-	foreach (Score in Scores) {
-		Scores::AddPlayerMatchPoints(Score, Scores::GetPlayerRoundPoints(Score));
-		Scores::SetPlayerRoundPoints(Score, 0);
-	}
-}
-
-// ---------------------------------- //
-/** Best score of the round (Null if nobody scored)
- */
-CSmScore GetRoundLeader() {
-	declare CSmScore Leader <=> Null;
-	declare LeaderPoints = 0;
-	foreach (Score in Scores) {
-		declare Points = GetRoundPoints(Score);
-		if (Points > LeaderPoints) {
-			LeaderPoints = Points;
-			Leader <=> Score;
-		}
-	}
-	return Leader;
-}
-
-CSmScore GetMatchLeader() {
-	declare CSmScore Leader <=> Null;
-	declare LeaderPoints = 0;
-	foreach (Score in Scores) {
-		declare Points = GetMatchPoints(Score);
-		if (Points > LeaderPoints) {
-			LeaderPoints = Points;
-			Leader <=> Score;
-		}
-	}
-	return Leader;
-}
-
-// ---------------------------------- //
-/** True when 2+ players share the top round score.
- *	Used to decide whether overtime should start.
- */
-Boolean IsRoundTied() {
-	if (Players.count < 2) return False;
-	declare Best = -1;
-	declare NbAtBest = 0;
-	foreach (Score in Scores) {
-		declare Points = GetRoundPoints(Score);
-		if (Points > Best) {
-			Best = Points;
-			NbAtBest = 1;
-		} else if (Points == Best) {
-			NbAtBest += 1;
-		}
-	}
-	return NbAtBest >= 2;
-}
-
-// ---------------------------------- //
-/** Collect the landmarks usable as spawn points and checkpoint locations
- */
-Void BuildCandidateLandmarks() {
-	G_CandidateLandmarks.clear();
-	foreach (Index => Landmark in MapLandmarks) {
-		// Keep race waypoints (start, checkpoints, finish) and spawn blocks
-		if (Landmark.Waypoint == Null && Landmark.Tag != "Spawn") continue;
-		G_CandidateLandmarks.add(Index);
-	}
-
-	if (G_CandidateLandmarks.count < 4) {
-		Chat("$f80Warning: this map has very few landmarks ($fff" ^ G_CandidateLandmarks.count ^ "$f80). Chaos Checkpoints plays best on maps with many checkpoints!");
-	}
-}
-
-// ---------------------------------- //
-/** True if a chaos checkpoint currently sits on this landmark
- */
-Boolean IsLandmarkUsed(Integer _LandmarkIndex) {
-	foreach (CP in G_ActiveCPs) {
-		if (CP.LandmarkIndex == _LandmarkIndex) return True;
-	}
-	return False;
-}
-
-// ---------------------------------- //
-/** Smallest distance from a position to any spawned player
- */
-Real DistanceToClosestPlayer(Vec3 _Position) {
-	declare Closest = 999999.;
-	foreach (Player in Players) {
-		if (Player.SpawnStatus != CSmPlayer::ESpawnStatus::Spawned) continue;
-		declare Distance = ML::Distance(Player.Position, _Position);
-		if (Distance < Closest) Closest = Distance;
-	}
-	return Closest;
-}
-
-// ---------------------------------- //
-/** Spawn one new chaos checkpoint at a random free landmark.
- *	Prefers locations at least S_MinCheckpointDistance away from every
- *	player; falls back to the farthest candidate found.
- *	During the frenzy finale (or when _ForceGolden is set) the checkpoint
- *	is always golden.
- */
-Void SpawnChaosCP(Integer _ExcludedLandmark, Boolean _ForceGolden) {
-	if (G_CandidateLandmarks.count <= 0) return;
-
-	declare BestIndex = -1;
-	declare BestDistance = -1.;
-	for (Try, 1, C_MaxPickTries) {
-		declare LandmarkIndex = G_CandidateLandmarks[ML::Rand(0, G_CandidateLandmarks.count - 1)];
-		if (LandmarkIndex == _ExcludedLandmark) continue;
-		if (IsLandmarkUsed(LandmarkIndex)) continue;
-		if (!MapLandmarks.existskey(LandmarkIndex)) continue;
-
-		declare Distance = DistanceToClosestPlayer(MapLandmarks[LandmarkIndex].Position);
-		if (Distance >= S_MinCheckpointDistance) {
-			BestIndex = LandmarkIndex;
-			break;
-		}
-		if (Distance > BestDistance) {
-			BestDistance = Distance;
-			BestIndex = LandmarkIndex;
-		}
-	}
-	if (BestIndex < 0 || !MapLandmarks.existskey(BestIndex)) return;
-
-	declare IsGolden = _ForceGolden || G_FrenzyActive || ML::Rand(1, 100) <= ML::Clamp(S_GoldenChance, 0, 100);
-	declare CP = K_ChaosCP {
-		LandmarkIndex = BestIndex,
-		Position = MapLandmarks[BestIndex].Position,
-		Points = C_PointsNormal,
-		IsGolden = IsGolden
-	};
-	if (IsGolden) CP.Points = C_PointsGolden;
-	G_ActiveCPs.add(CP);
-}
-
-// ---------------------------------- //
-/** Rebuild the 3D markers on every active chaos checkpoint,
- *	and push the positions to the clients for the HUD distance display.
- */
-Void RefreshMarkers() {
-	UIManager.UIAll.ClearMarkers();
-	foreach (CP in G_ActiveCPs) {
-		declare Marker = UIManager.UIAll.AddMarker(CP.Position + C_MarkerHeightOffset);
-		if (CP.IsGolden) {
-			Marker.Label = "$fd0★ +" ^ CP.Points;
-		} else {
-			Marker.Label = "$0cf◆ +" ^ CP.Points;
-		}
-		Marker.HudVisibility = CUIConfigMarker::EHudVisibility::Always;
-	}
-
-	declare netwrite Vec3[] Net_ChaosCP_Positions for Teams[0];
-	declare Vec3[] Positions;
-	foreach (CP in G_ActiveCPs) {
-		Positions.add(CP.Position);
-	}
-	Net_ChaosCP_Positions = Positions;
-}
-
-// ---------------------------------- //
-// Custom HUD (top right): round timer, round/points info, standings and
-// optional nearest-checkpoint distance. Data is pushed through netwrite
-// variables; the layout itself is static.
-// ---------------------------------- //
-Void SetHudEndTime(Integer _EndTime) {
-	declare netwrite Integer Net_ChaosCP_EndTime for Teams[0] = -1;
-	Net_ChaosCP_EndTime = _EndTime;
-}
-
-Void RefreshHud() {
-	declare netwrite Text Net_ChaosCP_Header for Teams[0] = "";
-	declare netwrite Text Net_ChaosCP_Standings for Teams[0] = "";
-	declare netwrite Boolean Net_ChaosCP_ShowDist for Teams[0] = False;
-
-	Net_ChaosCP_ShowDist = S_HudShowDistance;
-
-	declare Header = "Round " ^ G_RoundNb ^ "/" ^ ML::Max(S_RoundsPerMap, 1);
-	if (S_PointsLimit > 0) Header ^= " · First to " ^ S_PointsLimit;
-	if (G_InOvertime) Header = "OVERTIME — first claim wins!";
-	else if (G_FrenzyActive) Header ^= " · $fd0FRENZY!";
-	Net_ChaosCP_Header = Header;
-
-	// Sort players by (round + match) points, descending
-	declare Integer[Text] SortByLogin;
-	declare Text[Text] NameByLogin;
-	foreach (Score in Scores) {
-		if (Score.User == Null) continue;
-		SortByLogin[Score.User.Login] = -(GetRoundPoints(Score) + GetMatchPoints(Score));
-		NameByLogin[Score.User.Login] = Score.User.Name;
-	}
-	SortByLogin = SortByLogin.sort();
-
-	declare Standings = "";
-	declare Rank = 0;
-	foreach (Login => NegPoints in SortByLogin) {
-		Rank += 1;
-		if (Rank > 5) break;
-		declare Name = Login;
-		if (NameByLogin.existskey(Login)) Name = NameByLogin[Login];
-		Standings ^= Rank ^ ". $<$fff" ^ Name ^ "$> $ff0" ^ (-NegPoints) ^ "\n";
-	}
-	Net_ChaosCP_Standings = Standings;
-}
-
-Text GetHudManialink() {
-	return """
-<manialink version="3" name="ChaosCheckpoints_HUD">
-<frame pos="157 85">
-	<quad pos="2 3" size="56 48" halign="right" valign="top" bgcolor="000000" opacity="0.55"/>
-	<label pos="0 0" halign="right" textsize="5" textfont="GameFontExtraBold" textcolor="FFFFFF" id="Label_Timer" text="--:--"/>
-	<label pos="0 -9" halign="right" textsize="1.6" textcolor="FFCC00" id="Label_Header" text=""/>
-	<label pos="0 -13" halign="right" textsize="1.6" textcolor="00CCFF" id="Label_Dist" text=""/>
-	<label pos="0 -18" halign="right" textsize="1.6" textcolor="FFFFFF" id="Label_Standings" text=""/>
-</frame>
-<script><!--
-#Include "TextLib" as TL
-#Include "MathLib" as ML
-
-main() {
-	wait(Teams.count > 0 && Page != Null);
-	declare Label_Timer <=> (Page.GetFirstChild("Label_Timer") as CMlLabel);
-	declare Label_Header <=> (Page.GetFirstChild("Label_Header") as CMlLabel);
-	declare Label_Dist <=> (Page.GetFirstChild("Label_Dist") as CMlLabel);
-	declare Label_Standings <=> (Page.GetFirstChild("Label_Standings") as CMlLabel);
-
-	declare netread Integer Net_ChaosCP_EndTime for Teams[0] = -1;
-	declare netread Text Net_ChaosCP_Header for Teams[0] = "";
-	declare netread Text Net_ChaosCP_Standings for Teams[0] = "";
-	declare netread Boolean Net_ChaosCP_ShowDist for Teams[0] = False;
-	declare netread Vec3[] Net_ChaosCP_Positions for Teams[0];
-
-	while (True) {
-		yield;
-		if (Net_ChaosCP_EndTime > 0) {
-			declare TimeLeft = ML::Max(0, Net_ChaosCP_EndTime - GameTime);
-			Label_Timer.Value = TL::TimeToText(TimeLeft, False);
-		} else {
-			Label_Timer.Value = "";
-		}
-		Label_Header.Value = Net_ChaosCP_Header;
-		Label_Standings.Value = Net_ChaosCP_Standings;
-
-		// Live distance to the nearest chaos checkpoint
-		Label_Dist.Value = "";
-		if (Net_ChaosCP_ShowDist && Net_ChaosCP_Positions.count > 0) {
-			declare CSmPlayer Viewed <=> GUIPlayer;
-			if (Viewed == Null) Viewed <=> InputPlayer;
-			if (Viewed != Null && Viewed.SpawnStatus == CSmPlayer::ESpawnStatus::Spawned) {
-				declare Nearest = 999999.;
-				foreach (Position in Net_ChaosCP_Positions) {
-					declare Distance = ML::Distance(Viewed.Position, Position);
-					if (Distance < Nearest) Nearest = Distance;
-				}
-				Label_Dist.Value = "◆ nearest: " ^ ML::NearestInteger(Nearest) ^ " m";
-			}
-		}
-	}
-}
---></script>
-</manialink>
-""";
-}
-
-// ---------------------------------- //
-/** Spawn (or respawn) a player, at a random landmark when enabled.
- *
- *	Centralized here on purpose: this is the only place calling into the
- *	Race library's spawn functions.
- */
-Void ChaosSpawnPlayer(CSmPlayer _Player, Integer _StartTime) {
-	if (_Player == Null) return;
-
-	if (S_RandomPlayerSpawn && G_CandidateLandmarks.count > 0) {
-		// Try to pick a landmark that has no chaos checkpoint sitting on it,
-		// so nobody spawns straight into free points
-		declare PickedIndex = -1;
-		for (Try, 1, C_MaxPickTries) {
-			declare LandmarkIndex = G_CandidateLandmarks[ML::Rand(0, G_CandidateLandmarks.count - 1)];
-			PickedIndex = LandmarkIndex;
-			if (!IsLandmarkUsed(LandmarkIndex)) break;
-		}
-		if (PickedIndex >= 0 && MapLandmarks.existskey(PickedIndex)) {
-			declare Landmark <=> MapLandmarks[PickedIndex];
-			Race::Start(_Player, Landmark.Tag, Landmark.Order, _StartTime);
-			return;
-		}
-	}
-
-	// Fallback: regular spawn at the map start
-	Race::Start(_Player, _StartTime);
-}
 
 // ---------------------------------- //
 // Mode flow
@@ -468,16 +116,22 @@ Void ChaosSpawnPlayer(CSmPlayer _Player, Integer _StartTime) {
 
 ***Match_StartServer***
 ***
+declare Ident G_HudLayerId for This = NullId;
+
 // Custom HUD layer, kept for the whole server lifetime
-G_HudLayer <=> UIManager.UILayerCreate();
-G_HudLayer.Type = CUILayer::EUILayerType::Normal;
-G_HudLayer.ManialinkPage = GetHudManialink();
-UIManager.UIAll.UILayers.add(G_HudLayer);
+declare HudLayer <=> UIManager.UILayerCreate();
+HudLayer.Type = CUILayer::EUILayerType::Normal;
+HudLayer.ManialinkPage = GetHudManialink();
+UIManager.UIAll.UILayers.add(HudLayer);
+G_HudLayerId = HudLayer.Id;
 SetHudEndTime(-1);
 ***
 
 ***Match_StartMap***
 ***
+declare Integer G_RoundNb for This = 0;
+declare K_ChaosCP[] G_ActiveCPs for This;
+
 G_RoundNb = 0;
 G_ActiveCPs.clear();
 BuildCandidateLandmarks();
@@ -486,6 +140,18 @@ Chat("$0cfChaos Checkpoints$fff — random spawns, grab the marked checkpoints, 
 
 ***Match_StartRound***
 ***
+declare Integer G_RoundNb for This = 0;
+declare Boolean G_RoundEndRequested for This = False;
+declare Boolean G_FirstClaimDone for This = False;
+declare Boolean G_FrenzyActive for This = False;
+declare Boolean G_InOvertime for This = False;
+declare K_ChaosCP[] G_ActiveCPs for This;
+declare Integer[Text] G_RespawnAt for This;
+declare Integer[Text] G_LastClaimTime for This;
+declare Integer[Text] G_ComboCount for This;
+declare Integer G_RoundEndTime for This = 0;
+declare Integer G_NextShuffleTime for This = -1;
+
 G_RoundNb += 1;
 G_RoundEndRequested = False;
 G_FirstClaimDone = False;
@@ -526,6 +192,19 @@ Chat("Round $ff0" ^ G_RoundNb ^ "/" ^ ML::Max(S_RoundsPerMap, 1) ^ "$fff started
 
 ***Match_PlayLoop***
 ***
+declare Integer G_RoundNb for This = 0;
+declare Boolean G_RoundEndRequested for This = False;
+declare Boolean G_FirstClaimDone for This = False;
+declare Boolean G_FrenzyActive for This = False;
+declare Boolean G_InOvertime for This = False;
+declare K_ChaosCP[] G_ActiveCPs for This;
+declare Integer[Text] G_RespawnAt for This;
+declare Integer[Text] G_LastClaimTime for This;
+declare Integer[Text] G_ComboCount for This;
+declare Integer G_RoundEndTime for This = 0;
+declare Integer G_NextShuffleTime for This = -1;
+declare Integer G_OvertimeEndTime for This = 0;
+
 // ---------------------------------- //
 // 1. Throw unspawned players back in (join, finish, give up, crash out).
 //    Giving up is a legit tactic: it rerolls your position.
@@ -699,6 +378,9 @@ if (G_RoundEndRequested) {
 
 ***Match_EndRound***
 ***
+declare Integer G_RoundNb for This = 0;
+declare K_ChaosCP[] G_ActiveCPs for This;
+
 SetHudEndTime(-1);
 UIManager.UIAll.ClearMarkers();
 G_ActiveCPs.clear();
@@ -744,8 +426,385 @@ if (Winner != Null && Winner.User != Null) {
 
 ***Match_EndServer***
 ***
-if (G_HudLayer != Null) {
-	UIManager.UILayerDestroy(G_HudLayer);
-	G_HudLayer = Null;
+declare Ident G_HudLayerId for This = NullId;
+if (G_HudLayerId != NullId) {
+	foreach (Layer in UIManager.UILayers) {
+		if (Layer.Id == G_HudLayerId) {
+			UIManager.UILayerDestroy(Layer);
+			break;
+		}
+	}
+	G_HudLayerId = NullId;
 }
 ***
+
+// ---------------------------------- //
+// Helper functions
+//
+// Defined AFTER the labels on purpose: this server's script compiler
+// refuses label blocks that appear after a function definition in a mode
+// extension, but happily resolves calls to functions defined further down.
+// ---------------------------------- //
+Integer GetRoundTimeLimitMs() {
+	// Fast rounds by design: clamp between 1 and 10 minutes
+	return ML::Clamp(S_RoundTimeLimit, 60, 600) * 1000;
+}
+
+Integer GetNbChaosCheckpoints() {
+	declare Boolean G_FrenzyActive for This = False;
+	// Frenzy finale runs one extra checkpoint
+	declare Nb = ML::Clamp(S_NbChaosCheckpoints, 1, 8);
+	if (G_FrenzyActive) Nb += 1;
+	return Nb;
+}
+
+// ---------------------------------- //
+/** Chat announcement (respects S_ChatMessages)
+ */
+Void Chat(Text _Message) {
+	if (!S_ChatMessages) return;
+	UIManager.UIAll.SendChat("$ff0⚡ $fff" ^ _Message);
+}
+
+// ---------------------------------- //
+/** Big on-screen announcement, always shown
+ */
+Void Announce(Text _Message) {
+	UIManager.UIAll.QueueMessage(3000, 1, CUIConfig::EMessageDisplay::Big, _Message);
+}
+
+// ---------------------------------- //
+// Score helpers
+//
+// All interactions with the Scores library are centralized here so the mode
+// is easy to adjust if the library API changes between script pack versions.
+// ---------------------------------- //
+Void ResetRoundPoints() {
+	foreach (Score in Scores) {
+		Scores::SetPlayerRoundPoints(Score, 0);
+	}
+}
+
+Void AddRoundPoints(CSmScore _Score, Integer _Points) {
+	if (_Score == Null) return;
+	Scores::AddPlayerRoundPoints(_Score, _Points);
+}
+
+Void SetRoundPoints(CSmScore _Score, Integer _Points) {
+	if (_Score == Null) return;
+	Scores::SetPlayerRoundPoints(_Score, _Points);
+}
+
+Integer GetRoundPoints(CSmScore _Score) {
+	if (_Score == Null) return 0;
+	return Scores::GetPlayerRoundPoints(_Score);
+}
+
+Integer GetMatchPoints(CSmScore _Score) {
+	if (_Score == Null) return 0;
+	return Scores::GetPlayerMatchPoints(_Score);
+}
+
+// Move this round's points into the match total
+Void TransferRoundPointsToMatch() {
+	foreach (Score in Scores) {
+		Scores::AddPlayerMatchPoints(Score, Scores::GetPlayerRoundPoints(Score));
+		Scores::SetPlayerRoundPoints(Score, 0);
+	}
+}
+
+// ---------------------------------- //
+/** Best score of the round (Null if nobody scored)
+ */
+CSmScore GetRoundLeader() {
+	declare CSmScore Leader <=> Null;
+	declare LeaderPoints = 0;
+	foreach (Score in Scores) {
+		declare Points = GetRoundPoints(Score);
+		if (Points > LeaderPoints) {
+			LeaderPoints = Points;
+			Leader <=> Score;
+		}
+	}
+	return Leader;
+}
+
+CSmScore GetMatchLeader() {
+	declare CSmScore Leader <=> Null;
+	declare LeaderPoints = 0;
+	foreach (Score in Scores) {
+		declare Points = GetMatchPoints(Score);
+		if (Points > LeaderPoints) {
+			LeaderPoints = Points;
+			Leader <=> Score;
+		}
+	}
+	return Leader;
+}
+
+// ---------------------------------- //
+/** True when 2+ players share the top round score.
+ *	Used to decide whether overtime should start.
+ */
+Boolean IsRoundTied() {
+	if (Players.count < 2) return False;
+	declare Best = -1;
+	declare NbAtBest = 0;
+	foreach (Score in Scores) {
+		declare Points = GetRoundPoints(Score);
+		if (Points > Best) {
+			Best = Points;
+			NbAtBest = 1;
+		} else if (Points == Best) {
+			NbAtBest += 1;
+		}
+	}
+	return NbAtBest >= 2;
+}
+
+// ---------------------------------- //
+/** Collect the landmarks usable as spawn points and checkpoint locations
+ */
+Void BuildCandidateLandmarks() {
+	declare Integer[] G_CandidateLandmarks for This;
+	G_CandidateLandmarks.clear();
+	foreach (Index => Landmark in MapLandmarks) {
+		// Keep race waypoints (start, checkpoints, finish) and spawn blocks
+		if (Landmark.Waypoint == Null && Landmark.Tag != "Spawn") continue;
+		G_CandidateLandmarks.add(Index);
+	}
+
+	if (G_CandidateLandmarks.count < 4) {
+		Chat("$f80Warning: this map has very few landmarks ($fff" ^ G_CandidateLandmarks.count ^ "$f80). Chaos Checkpoints plays best on maps with many checkpoints!");
+	}
+}
+
+// ---------------------------------- //
+/** True if a chaos checkpoint currently sits on this landmark
+ */
+Boolean IsLandmarkUsed(Integer _LandmarkIndex) {
+	declare K_ChaosCP[] G_ActiveCPs for This;
+	foreach (CP in G_ActiveCPs) {
+		if (CP.LandmarkIndex == _LandmarkIndex) return True;
+	}
+	return False;
+}
+
+// ---------------------------------- //
+/** Smallest distance from a position to any spawned player
+ */
+Real DistanceToClosestPlayer(Vec3 _Position) {
+	declare Closest = 999999.;
+	foreach (Player in Players) {
+		if (Player.SpawnStatus != CSmPlayer::ESpawnStatus::Spawned) continue;
+		declare Distance = ML::Distance(Player.Position, _Position);
+		if (Distance < Closest) Closest = Distance;
+	}
+	return Closest;
+}
+
+// ---------------------------------- //
+/** Spawn one new chaos checkpoint at a random free landmark.
+ *	Prefers locations at least S_MinCheckpointDistance away from every
+ *	player; falls back to the farthest candidate found.
+ *	During the frenzy finale (or when _ForceGolden is set) the checkpoint
+ *	is always golden.
+ */
+Void SpawnChaosCP(Integer _ExcludedLandmark, Boolean _ForceGolden) {
+	declare Integer[] G_CandidateLandmarks for This;
+	declare K_ChaosCP[] G_ActiveCPs for This;
+	declare Boolean G_FrenzyActive for This = False;
+	if (G_CandidateLandmarks.count <= 0) return;
+
+	declare BestIndex = -1;
+	declare BestDistance = -1.;
+	for (Try, 1, C_MaxPickTries) {
+		declare LandmarkIndex = G_CandidateLandmarks[ML::Rand(0, G_CandidateLandmarks.count - 1)];
+		if (LandmarkIndex == _ExcludedLandmark) continue;
+		if (IsLandmarkUsed(LandmarkIndex)) continue;
+		if (!MapLandmarks.existskey(LandmarkIndex)) continue;
+
+		declare Distance = DistanceToClosestPlayer(MapLandmarks[LandmarkIndex].Position);
+		if (Distance >= S_MinCheckpointDistance) {
+			BestIndex = LandmarkIndex;
+			break;
+		}
+		if (Distance > BestDistance) {
+			BestDistance = Distance;
+			BestIndex = LandmarkIndex;
+		}
+	}
+	if (BestIndex < 0 || !MapLandmarks.existskey(BestIndex)) return;
+
+	declare IsGolden = _ForceGolden || G_FrenzyActive || ML::Rand(1, 100) <= ML::Clamp(S_GoldenChance, 0, 100);
+	declare CP = K_ChaosCP {
+		LandmarkIndex = BestIndex,
+		Position = MapLandmarks[BestIndex].Position,
+		Points = C_PointsNormal,
+		IsGolden = IsGolden
+	};
+	if (IsGolden) CP.Points = C_PointsGolden;
+	G_ActiveCPs.add(CP);
+}
+
+// ---------------------------------- //
+/** Rebuild the 3D markers on every active chaos checkpoint,
+ *	and push the positions to the clients for the HUD distance display.
+ */
+Void RefreshMarkers() {
+	declare K_ChaosCP[] G_ActiveCPs for This;
+	UIManager.UIAll.ClearMarkers();
+	foreach (CP in G_ActiveCPs) {
+		declare Marker = UIManager.UIAll.AddMarker(CP.Position + C_MarkerHeightOffset);
+		if (CP.IsGolden) {
+			Marker.Label = "$fd0★ +" ^ CP.Points;
+		} else {
+			Marker.Label = "$0cf◆ +" ^ CP.Points;
+		}
+		Marker.HudVisibility = CUIConfigMarker::EHudVisibility::Always;
+	}
+
+	declare netwrite Vec3[] Net_ChaosCP_Positions for Teams[0];
+	declare Vec3[] Positions;
+	foreach (CP in G_ActiveCPs) {
+		Positions.add(CP.Position);
+	}
+	Net_ChaosCP_Positions = Positions;
+}
+
+// ---------------------------------- //
+// Custom HUD (top right): round timer, round/points info, standings and
+// optional nearest-checkpoint distance. Data is pushed through netwrite
+// variables; the layout itself is static.
+// ---------------------------------- //
+Void SetHudEndTime(Integer _EndTime) {
+	declare netwrite Integer Net_ChaosCP_EndTime for Teams[0] = -1;
+	Net_ChaosCP_EndTime = _EndTime;
+}
+
+Void RefreshHud() {
+	declare Integer G_RoundNb for This = 0;
+	declare Boolean G_InOvertime for This = False;
+	declare Boolean G_FrenzyActive for This = False;
+	declare netwrite Text Net_ChaosCP_Header for Teams[0] = "";
+	declare netwrite Text Net_ChaosCP_Standings for Teams[0] = "";
+	declare netwrite Boolean Net_ChaosCP_ShowDist for Teams[0] = False;
+
+	Net_ChaosCP_ShowDist = S_HudShowDistance;
+
+	declare Header = "Round " ^ G_RoundNb ^ "/" ^ ML::Max(S_RoundsPerMap, 1);
+	if (S_PointsLimit > 0) Header ^= " · First to " ^ S_PointsLimit;
+	if (G_InOvertime) Header = "OVERTIME — first claim wins!";
+	else if (G_FrenzyActive) Header ^= " · $fd0FRENZY!";
+	Net_ChaosCP_Header = Header;
+
+	// Sort players by (round + match) points, descending
+	declare Integer[Text] SortByLogin;
+	declare Text[Text] NameByLogin;
+	foreach (Score in Scores) {
+		if (Score.User == Null) continue;
+		SortByLogin[Score.User.Login] = -(GetRoundPoints(Score) + GetMatchPoints(Score));
+		NameByLogin[Score.User.Login] = Score.User.Name;
+	}
+	SortByLogin = SortByLogin.sort();
+
+	declare Standings = "";
+	declare Rank = 0;
+	foreach (Login => NegPoints in SortByLogin) {
+		Rank += 1;
+		if (Rank > 5) break;
+		declare Name = Login;
+		if (NameByLogin.existskey(Login)) Name = NameByLogin[Login];
+		Standings ^= Rank ^ ". $<$fff" ^ Name ^ "$> $ff0" ^ (-NegPoints) ^ "\n";
+	}
+	Net_ChaosCP_Standings = Standings;
+}
+
+Text GetHudManialink() {
+	return """
+<manialink version="3" name="ChaosCheckpoints_HUD">
+<frame pos="157 85">
+	<quad pos="2 3" size="56 48" halign="right" valign="top" bgcolor="000000" opacity="0.55"/>
+	<label pos="0 0" halign="right" textsize="5" textfont="GameFontExtraBold" textcolor="FFFFFF" id="Label_Timer" text="--:--"/>
+	<label pos="0 -9" halign="right" textsize="1.6" textcolor="FFCC00" id="Label_Header" text=""/>
+	<label pos="0 -13" halign="right" textsize="1.6" textcolor="00CCFF" id="Label_Dist" text=""/>
+	<label pos="0 -18" halign="right" textsize="1.6" textcolor="FFFFFF" id="Label_Standings" text=""/>
+</frame>
+<script><!--
+#Include "TextLib" as TL
+#Include "MathLib" as ML
+
+main() {
+	wait(Teams.count > 0 && Page != Null);
+	declare Label_Timer <=> (Page.GetFirstChild("Label_Timer") as CMlLabel);
+	declare Label_Header <=> (Page.GetFirstChild("Label_Header") as CMlLabel);
+	declare Label_Dist <=> (Page.GetFirstChild("Label_Dist") as CMlLabel);
+	declare Label_Standings <=> (Page.GetFirstChild("Label_Standings") as CMlLabel);
+
+	declare netread Integer Net_ChaosCP_EndTime for Teams[0] = -1;
+	declare netread Text Net_ChaosCP_Header for Teams[0] = "";
+	declare netread Text Net_ChaosCP_Standings for Teams[0] = "";
+	declare netread Boolean Net_ChaosCP_ShowDist for Teams[0] = False;
+	declare netread Vec3[] Net_ChaosCP_Positions for Teams[0];
+
+	while (True) {
+		yield;
+		if (Net_ChaosCP_EndTime > 0) {
+			declare TimeLeft = ML::Max(0, Net_ChaosCP_EndTime - GameTime);
+			Label_Timer.Value = TL::TimeToText(TimeLeft, False);
+		} else {
+			Label_Timer.Value = "";
+		}
+		Label_Header.Value = Net_ChaosCP_Header;
+		Label_Standings.Value = Net_ChaosCP_Standings;
+
+		// Live distance to the nearest chaos checkpoint
+		Label_Dist.Value = "";
+		if (Net_ChaosCP_ShowDist && Net_ChaosCP_Positions.count > 0) {
+			declare CSmPlayer Viewed <=> GUIPlayer;
+			if (Viewed == Null) Viewed <=> InputPlayer;
+			if (Viewed != Null && Viewed.SpawnStatus == CSmPlayer::ESpawnStatus::Spawned) {
+				declare Nearest = 999999.;
+				foreach (Position in Net_ChaosCP_Positions) {
+					declare Distance = ML::Distance(Viewed.Position, Position);
+					if (Distance < Nearest) Nearest = Distance;
+				}
+				Label_Dist.Value = "◆ nearest: " ^ ML::NearestInteger(Nearest) ^ " m";
+			}
+		}
+	}
+}
+--></script>
+</manialink>
+""";
+}
+
+// ---------------------------------- //
+/** Spawn (or respawn) a player, at a random landmark when enabled.
+ *
+ *	Centralized here on purpose: this is the only place calling into the
+ *	Race library's spawn functions.
+ */
+Void ChaosSpawnPlayer(CSmPlayer _Player, Integer _StartTime) {
+	declare Integer[] G_CandidateLandmarks for This;
+	if (_Player == Null) return;
+
+	if (S_RandomPlayerSpawn && G_CandidateLandmarks.count > 0) {
+		// Try to pick a landmark that has no chaos checkpoint sitting on it,
+		// so nobody spawns straight into free points
+		declare PickedIndex = -1;
+		for (Try, 1, C_MaxPickTries) {
+			declare LandmarkIndex = G_CandidateLandmarks[ML::Rand(0, G_CandidateLandmarks.count - 1)];
+			PickedIndex = LandmarkIndex;
+			if (!IsLandmarkUsed(LandmarkIndex)) break;
+		}
+		if (PickedIndex >= 0 && MapLandmarks.existskey(PickedIndex)) {
+			declare Landmark <=> MapLandmarks[PickedIndex];
+			Race::Start(_Player, Landmark.Tag, Landmark.Order, _StartTime);
+			return;
+		}
+	}
+
+	// Fallback: regular spawn at the map start
+	Race::Start(_Player, _StartTime);
+}
