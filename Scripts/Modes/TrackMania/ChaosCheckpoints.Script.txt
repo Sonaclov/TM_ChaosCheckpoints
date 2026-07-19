@@ -800,7 +800,7 @@ Void ChaosSpawnPlayer(CSmPlayer _Player, Integer _StartTime) {
 		}
 		if (PickedIndex >= 0 && MapLandmarks.existskey(PickedIndex)) {
 			declare Landmark <=> MapLandmarks[PickedIndex];
-			Race::Start(_Player, Landmark.Tag, Landmark.Order, _StartTime);
+			Race::Start(_Player, Landmark, _StartTime);
 			return;
 		}
 	}
