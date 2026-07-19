@@ -24,6 +24,27 @@
 		<setting name="S_RandomPlayerSpawn" type="boolean" value="1"/>
 		<!-- Announce claims and results in the chat. -->
 		<setting name="S_ChatMessages" type="boolean" value="1"/>
+
+		<!-- ============ Optional extras ============ -->
+		<!-- Combos: max seconds between claims to keep a chain going (0 = disabled).
+		     Each chained claim adds +1 bonus point, up to +3. -->
+		<setting name="S_ComboWindow" type="integer" value="15"/>
+		<!-- Frenzy finale: during the last seconds of a round, every checkpoint
+		     turns golden and one extra checkpoint is active. -->
+		<setting name="S_FrenzyFinale" type="boolean" value="1"/>
+		<!-- Frenzy finale length in seconds (clamped to 10-300). -->
+		<setting name="S_FrenzyDuration" type="integer" value="60"/>
+		<!-- Teleport all unclaimed checkpoints every N seconds (0 = disabled, min 15). -->
+		<setting name="S_ShuffleInterval" type="integer" value="0"/>
+		<!-- Sudden-death overtime when a round ends tied: one golden decider
+		     checkpoint, first claim wins (overtime capped at 60s). -->
+		<setting name="S_Overtime" type="boolean" value="1"/>
+		<!-- Golden checkpoints also steal 1 point from the round leader. -->
+		<setting name="S_GoldenSteal" type="boolean" value="0"/>
+		<!-- Bonus points for the very first claim of a round (0 = disabled). -->
+		<setting name="S_FirstClaimBonus" type="integer" value="1"/>
+		<!-- Show the distance to the nearest chaos checkpoint in the HUD. -->
+		<setting name="S_HudShowDistance" type="boolean" value="1"/>
 	</mode_script_settings>
 
 	<startindex>0</startindex>

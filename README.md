@@ -18,6 +18,18 @@ A fast, free-roam custom game mode for **Trackmania (2020)**: random spawns, vir
 
 The round timer defaults to **8 minutes** and is hard-clamped by the mode to **60–600 seconds** (max 10 minutes), so rounds always stay short. After the configured number of rounds (2 by default), the player with the highest total wins the map and the server moves on.
 
+## Optional extras (server settings)
+
+Every extra can be toggled or tuned individually from the match settings:
+
+- **Combos** (`S_ComboWindow`, default on at 15 s): claim checkpoints back-to-back within the window to build a chain. Each chained claim adds +1 bonus point, capped at +3. Set to `0` to disable.
+- **Frenzy finale** (`S_FrenzyFinale` + `S_FrenzyDuration`, default on, 60 s): during the last seconds of a round every checkpoint turns golden and one extra checkpoint goes live. Great for comebacks.
+- **Shuffle** (`S_ShuffleInterval`, default off): every N seconds all unclaimed checkpoints teleport to new locations. Punishes camping, rewards map awareness.
+- **Overtime** (`S_Overtime`, default on): if the round ends tied, sudden death starts — a single golden decider checkpoint spawns and the first claim wins the round. Overtime is capped at 60 s; if nobody claims, the draw stands.
+- **Golden steal** (`S_GoldenSteal`, default off): golden checkpoints also steal 1 point from the current round leader. Spicy catch-up mechanic for competitive lobbies.
+- **First-claim bonus** (`S_FirstClaimBonus`, default +1): extra points for the very first claim of a round. Set to `0` to disable.
+- **HUD distance** (`S_HudShowDistance`, default on): shows the live distance to the nearest chaos checkpoint in the HUD.
+
 ## Repository layout
 
 ```
@@ -55,12 +67,21 @@ You can also switch a running server to the mode with your server controller of 
 | `S_MinCheckpointDistance` | `60.0` | Preferred minimum distance from players when a new checkpoint spawns. |
 | `S_RandomPlayerSpawn` | `True` | Random spawns/respawns. Disable to always spawn at the map start. |
 | `S_ChatMessages` | `True` | Chat announcements for claims and results. |
+| `S_ComboWindow` | `15` | Seconds between claims to keep a combo chain going. `0` = combos off. |
+| `S_FrenzyFinale` | `True` | Golden-everything finale during the last seconds of a round. |
+| `S_FrenzyDuration` | `60` | Frenzy finale length in seconds (clamped 10–300). |
+| `S_ShuffleInterval` | `0` | Teleport all unclaimed checkpoints every N seconds. `0` = off, min 15. |
+| `S_Overtime` | `True` | Sudden-death overtime on a tied round (max 60 s). |
+| `S_GoldenSteal` | `False` | Golden checkpoints also steal 1 point from the round leader. |
+| `S_FirstClaimBonus` | `1` | Bonus points for the first claim of a round. `0` = off. |
+| `S_HudShowDistance` | `True` | Nearest-checkpoint distance in the HUD. |
 
 ### Suggested presets
 
-- **Quick chaos (casual lobby):** `S_RoundTimeLimit=300`, `S_PointsLimit=10`, `S_NbChaosCheckpoints=4`, `S_GoldenChance=25`
-- **Standard (default):** 8-minute rounds, first to 15, 3 checkpoints
+- **Quick chaos (casual lobby):** `S_RoundTimeLimit=300`, `S_PointsLimit=10`, `S_NbChaosCheckpoints=4`, `S_GoldenChance=25`, `S_ShuffleInterval=45`
+- **Standard (default):** 8-minute rounds, first to 15, 3 checkpoints, combos + frenzy + overtime on
 - **Endurance-lite:** `S_RoundTimeLimit=600`, `S_PointsLimit=0` (pure timer, most points wins), `S_RoundsPerMap=1`
+- **Competitive:** `S_ComboWindow=0`, `S_FirstClaimBonus=0`, `S_GoldenSteal=False`, `S_FrenzyFinale=False` — pure racing, no swing mechanics; keep `S_Overtime=True` so ties always resolve
 
 ## Map recommendations
 

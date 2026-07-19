@@ -14,6 +14,16 @@
  *	  (default 480s = 8 minutes, hard max 10 minutes).
  *	- The player with the most points after all rounds wins the map.
  *
+ *	Optional extras, all controlled by server settings:
+ *	- Combos: chain claims within a time window for bonus points.
+ *	- Frenzy finale: during the last seconds every checkpoint is golden
+ *	  and one extra checkpoint is active.
+ *	- Shuffle: all unclaimed checkpoints periodically teleport.
+ *	- Overtime: on a tied round, sudden death — first claim wins.
+ *	- Golden steal: golden checkpoints also steal a point from the leader.
+ *	- First-claim bonus: extra points for the first claim of the round.
+ *	- HUD distance: live distance to the nearest checkpoint.
+ *
  *	The chaos checkpoints are fully virtual: they reuse the positions of the
  *	map's landmarks (checkpoints, starts, finish) as candidate locations, but
  *	claiming is done by distance check, not by the map's race route. Any
@@ -22,14 +32,14 @@
 #Extends "Modes/Nadeo/Trackmania/Base/TrackmaniaBase.Script.txt"
 
 #Const CompatibleMapTypes "TrackMania\\TM_Race,TM_Race"
-#Const Version "1.0.0"
+#Const Version "1.1.0"
 #Const ScriptName "Modes/TrackMania/ChaosCheckpoints.Script.txt"
 
 #Include "MathLib" as ML
 #Include "TextLib" as TL
 
 // ---------------------------------- //
-// Settings
+// Settings — core rules
 // ---------------------------------- //
 #Setting S_RoundTimeLimit 480 as _("Round time limit in seconds (clamped to 60-600)")
 #Setting S_PointsLimit 15 as _("Points needed to instantly win a round (0 = timer only)")
@@ -42,10 +52,24 @@
 #Setting S_ChatMessages True as _("Announce claims and results in the chat")
 
 // ---------------------------------- //
+// Settings — optional extras
+// ---------------------------------- //
+#Setting S_ComboWindow 15 as _("Combo: max seconds between claims to keep a chain going (0 = combos disabled)")
+#Setting S_FrenzyFinale True as _("Frenzy finale: all checkpoints golden + 1 extra during the last seconds of a round")
+#Setting S_FrenzyDuration 60 as _("Frenzy finale length in seconds (clamped to 10-300)")
+#Setting S_ShuffleInterval 0 as _("Teleport all unclaimed checkpoints every N seconds (0 = disabled, min 15)")
+#Setting S_Overtime True as _("Sudden-death overtime when a round ends tied: first claim wins (max 60s)")
+#Setting S_GoldenSteal False as _("Golden checkpoints also steal 1 point from the round leader")
+#Setting S_FirstClaimBonus 1 as _("Bonus points for the very first claim of a round (0 = disabled)")
+#Setting S_HudShowDistance True as _("Show the distance to the nearest chaos checkpoint in the HUD")
+
+// ---------------------------------- //
 // Constants
 // ---------------------------------- //
 #Const C_PointsNormal 1				// Points for a regular chaos checkpoint
 #Const C_PointsGolden 3				// Points for a golden chaos checkpoint
+#Const C_ComboMaxBonus 3			// Max bonus points a combo chain can add per claim
+#Const C_OvertimeMaxMs 60000		// Hard cap on overtime length
 #Const C_SpawnCountdownMs 3000		// Countdown before players are released at round start
 #Const C_RespawnDelayMs 1500		// Delay before an unspawned player is thrown back in
 #Const C_EndRoundPauseMs 7000		// Pause between rounds to show the results
@@ -70,8 +94,17 @@ declare Integer[] G_CandidateLandmarks;		// Indexes into MapLandmarks usable as 
 declare Integer G_RoundEndTime;				// Server time at which the round ends
 declare Integer G_RoundNb;					// Current round number on this map
 declare Integer[Text] G_RespawnAt;			// Login => time at which to respawn the player
-declare Boolean G_RoundEndRequested;		// A player reached the points limit
+declare Boolean G_RoundEndRequested;		// A player reached the points limit / won overtime
 declare CUILayer G_HudLayer;				// Custom HUD (timer + standings)
+
+// Optional extras state
+declare Integer[Text] G_LastClaimTime;		// Login => time of their latest claim (combos)
+declare Integer[Text] G_ComboCount;			// Login => current chain length (combos)
+declare Boolean G_FirstClaimDone;			// First-claim bonus already awarded this round
+declare Boolean G_FrenzyActive;				// Frenzy finale is running
+declare Integer G_NextShuffleTime;			// Next scheduled checkpoint shuffle
+declare Boolean G_InOvertime;				// Sudden-death overtime is running
+declare Integer G_OvertimeEndTime;			// Hard end of overtime
 
 // ---------------------------------- //
 // Small helpers around tunable settings
@@ -82,7 +115,10 @@ Integer GetRoundTimeLimitMs() {
 }
 
 Integer GetNbChaosCheckpoints() {
-	return ML::Clamp(S_NbChaosCheckpoints, 1, 8);
+	// Frenzy finale runs one extra checkpoint
+	declare Nb = ML::Clamp(S_NbChaosCheckpoints, 1, 8);
+	if (G_FrenzyActive) Nb += 1;
+	return Nb;
 }
 
 // ---------------------------------- //
@@ -115,6 +151,11 @@ Void ResetRoundPoints() {
 Void AddRoundPoints(CSmScore _Score, Integer _Points) {
 	if (_Score == Null) return;
 	Scores::AddPlayerRoundPoints(_Score, _Points);
+}
+
+Void SetRoundPoints(CSmScore _Score, Integer _Points) {
+	if (_Score == Null) return;
+	Scores::SetPlayerRoundPoints(_Score, _Points);
 }
 
 Integer GetRoundPoints(CSmScore _Score) {
@@ -165,6 +206,26 @@ CSmScore GetMatchLeader() {
 }
 
 // ---------------------------------- //
+/** True when 2+ players share the top round score.
+ *	Used to decide whether overtime should start.
+ */
+Boolean IsRoundTied() {
+	if (Players.count < 2) return False;
+	declare Best = -1;
+	declare NbAtBest = 0;
+	foreach (Score in Scores) {
+		declare Points = GetRoundPoints(Score);
+		if (Points > Best) {
+			Best = Points;
+			NbAtBest = 1;
+		} else if (Points == Best) {
+			NbAtBest += 1;
+		}
+	}
+	return NbAtBest >= 2;
+}
+
+// ---------------------------------- //
 /** Collect the landmarks usable as spawn points and checkpoint locations
  */
 Void BuildCandidateLandmarks() {
@@ -207,8 +268,10 @@ Real DistanceToClosestPlayer(Vec3 _Position) {
 /** Spawn one new chaos checkpoint at a random free landmark.
  *	Prefers locations at least S_MinCheckpointDistance away from every
  *	player; falls back to the farthest candidate found.
+ *	During the frenzy finale (or when _ForceGolden is set) the checkpoint
+ *	is always golden.
  */
-Void SpawnChaosCP(Integer _ExcludedLandmark) {
+Void SpawnChaosCP(Integer _ExcludedLandmark, Boolean _ForceGolden) {
 	if (G_CandidateLandmarks.count <= 0) return;
 
 	declare BestIndex = -1;
@@ -231,7 +294,7 @@ Void SpawnChaosCP(Integer _ExcludedLandmark) {
 	}
 	if (BestIndex < 0 || !MapLandmarks.existskey(BestIndex)) return;
 
-	declare IsGolden = ML::Rand(1, 100) <= ML::Clamp(S_GoldenChance, 0, 100);
+	declare IsGolden = _ForceGolden || G_FrenzyActive || ML::Rand(1, 100) <= ML::Clamp(S_GoldenChance, 0, 100);
 	declare CP = K_ChaosCP {
 		LandmarkIndex = BestIndex,
 		Position = MapLandmarks[BestIndex].Position,
@@ -243,7 +306,8 @@ Void SpawnChaosCP(Integer _ExcludedLandmark) {
 }
 
 // ---------------------------------- //
-/** Rebuild the 3D markers shown on every active chaos checkpoint
+/** Rebuild the 3D markers on every active chaos checkpoint,
+ *	and push the positions to the clients for the HUD distance display.
  */
 Void RefreshMarkers() {
 	UIManager.UIAll.ClearMarkers();
@@ -256,11 +320,19 @@ Void RefreshMarkers() {
 		}
 		Marker.HudVisibility = CUIConfigMarker::EHudVisibility::Always;
 	}
+
+	declare netwrite Vec3[] Net_ChaosCP_Positions for Teams[0];
+	declare Vec3[] Positions;
+	foreach (CP in G_ActiveCPs) {
+		Positions.add(CP.Position);
+	}
+	Net_ChaosCP_Positions = Positions;
 }
 
 // ---------------------------------- //
-// Custom HUD (top right): round timer, round/points info, standings.
-// Data is pushed through netwrite variables; the layout itself is static.
+// Custom HUD (top right): round timer, round/points info, standings and
+// optional nearest-checkpoint distance. Data is pushed through netwrite
+// variables; the layout itself is static.
 // ---------------------------------- //
 Void SetHudEndTime(Integer _EndTime) {
 	declare netwrite Integer Net_ChaosCP_EndTime for Teams[0] = -1;
@@ -270,9 +342,14 @@ Void SetHudEndTime(Integer _EndTime) {
 Void RefreshHud() {
 	declare netwrite Text Net_ChaosCP_Header for Teams[0] = "";
 	declare netwrite Text Net_ChaosCP_Standings for Teams[0] = "";
+	declare netwrite Boolean Net_ChaosCP_ShowDist for Teams[0] = False;
+
+	Net_ChaosCP_ShowDist = S_HudShowDistance;
 
 	declare Header = "Round " ^ G_RoundNb ^ "/" ^ ML::Max(S_RoundsPerMap, 1);
 	if (S_PointsLimit > 0) Header ^= " · First to " ^ S_PointsLimit;
+	if (G_InOvertime) Header = "OVERTIME — first claim wins!";
+	else if (G_FrenzyActive) Header ^= " · $fd0FRENZY!";
 	Net_ChaosCP_Header = Header;
 
 	// Sort players by (round + match) points, descending
@@ -301,10 +378,11 @@ Text GetHudManialink() {
 	return """
 <manialink version="3" name="ChaosCheckpoints_HUD">
 <frame pos="157 85">
-	<quad pos="2 3" size="56 42" halign="right" valign="top" bgcolor="000000" opacity="0.55"/>
+	<quad pos="2 3" size="56 48" halign="right" valign="top" bgcolor="000000" opacity="0.55"/>
 	<label pos="0 0" halign="right" textsize="5" textfont="GameFontExtraBold" textcolor="FFFFFF" id="Label_Timer" text="--:--"/>
 	<label pos="0 -9" halign="right" textsize="1.6" textcolor="FFCC00" id="Label_Header" text=""/>
-	<label pos="0 -14" halign="right" textsize="1.6" textcolor="FFFFFF" id="Label_Standings" text=""/>
+	<label pos="0 -13" halign="right" textsize="1.6" textcolor="00CCFF" id="Label_Dist" text=""/>
+	<label pos="0 -18" halign="right" textsize="1.6" textcolor="FFFFFF" id="Label_Standings" text=""/>
 </frame>
 <script><!--
 #Include "TextLib" as TL
@@ -314,11 +392,14 @@ main() {
 	wait(Teams.count > 0 && Page != Null);
 	declare Label_Timer <=> (Page.GetFirstChild("Label_Timer") as CMlLabel);
 	declare Label_Header <=> (Page.GetFirstChild("Label_Header") as CMlLabel);
+	declare Label_Dist <=> (Page.GetFirstChild("Label_Dist") as CMlLabel);
 	declare Label_Standings <=> (Page.GetFirstChild("Label_Standings") as CMlLabel);
 
 	declare netread Integer Net_ChaosCP_EndTime for Teams[0] = -1;
 	declare netread Text Net_ChaosCP_Header for Teams[0] = "";
 	declare netread Text Net_ChaosCP_Standings for Teams[0] = "";
+	declare netread Boolean Net_ChaosCP_ShowDist for Teams[0] = False;
+	declare netread Vec3[] Net_ChaosCP_Positions for Teams[0];
 
 	while (True) {
 		yield;
@@ -330,6 +411,21 @@ main() {
 		}
 		Label_Header.Value = Net_ChaosCP_Header;
 		Label_Standings.Value = Net_ChaosCP_Standings;
+
+		// Live distance to the nearest chaos checkpoint
+		Label_Dist.Value = "";
+		if (Net_ChaosCP_ShowDist && Net_ChaosCP_Positions.count > 0) {
+			declare CSmPlayer Viewed <=> GUIPlayer;
+			if (Viewed == Null) Viewed <=> InputPlayer;
+			if (Viewed != Null && Viewed.SpawnStatus == CSmPlayer::ESpawnStatus::Spawned) {
+				declare Nearest = 999999.;
+				foreach (Position in Net_ChaosCP_Positions) {
+					declare Distance = ML::Distance(Viewed.Position, Position);
+					if (Distance < Nearest) Nearest = Distance;
+				}
+				Label_Dist.Value = "◆ nearest: " ^ ML::NearestInteger(Nearest) ^ " m";
+			}
+		}
 	}
 }
 --></script>
@@ -392,8 +488,13 @@ Chat("$0cfChaos Checkpoints$fff — random spawns, grab the marked checkpoints, 
 ***
 G_RoundNb += 1;
 G_RoundEndRequested = False;
+G_FirstClaimDone = False;
+G_FrenzyActive = False;
+G_InOvertime = False;
 G_ActiveCPs.clear();
 G_RespawnAt.clear();
+G_LastClaimTime.clear();
+G_ComboCount.clear();
 ResetRoundPoints();
 
 // Everyone spawns somewhere random, with a short countdown
@@ -406,9 +507,15 @@ foreach (Player in Players) {
 G_RoundEndTime = SpawnTime + GetRoundTimeLimitMs();
 SetHudEndTime(G_RoundEndTime);
 
+// First checkpoint shuffle, if enabled
+G_NextShuffleTime = -1;
+if (S_ShuffleInterval > 0) {
+	G_NextShuffleTime = SpawnTime + ML::Clamp(S_ShuffleInterval, 15, 600) * 1000;
+}
+
 // Initial batch of chaos checkpoints
 for (I, 1, GetNbChaosCheckpoints()) {
-	SpawnChaosCP(-1);
+	SpawnChaosCP(-1, False);
 }
 RefreshMarkers();
 RefreshHud();
@@ -435,7 +542,39 @@ foreach (Player in Players) {
 }
 
 // ---------------------------------- //
-// 2. Proximity claims: first spawned player inside the radius takes it
+// 2. Frenzy finale: last seconds of the round, everything turns golden
+if (S_FrenzyFinale && !G_FrenzyActive && !G_InOvertime
+	&& G_RoundEndTime - Now <= ML::Clamp(S_FrenzyDuration, 10, 300) * 1000) {
+	G_FrenzyActive = True;
+	declare K_ChaosCP[] GoldenCPs;
+	foreach (CP in G_ActiveCPs) {
+		declare Golden = CP;
+		Golden.IsGolden = True;
+		Golden.Points = C_PointsGolden;
+		GoldenCPs.add(Golden);
+	}
+	G_ActiveCPs = GoldenCPs;
+	RefreshMarkers();
+	RefreshHud();
+	Announce("$fd0FRENZY! Every checkpoint is golden!");
+	Chat("$fd0FRENZY FINALE! $fffAll checkpoints are worth $fd0+" ^ C_PointsGolden ^ "$fff and an extra one is live!");
+}
+
+// ---------------------------------- //
+// 3. Scheduled shuffle: unclaimed checkpoints teleport
+if (G_NextShuffleTime > 0 && !G_InOvertime && Now >= G_NextShuffleTime) {
+	G_NextShuffleTime = Now + ML::Clamp(S_ShuffleInterval, 15, 600) * 1000;
+	declare NbToRespawn = G_ActiveCPs.count;
+	G_ActiveCPs.clear();
+	for (I, 1, NbToRespawn) {
+		SpawnChaosCP(-1, False);
+	}
+	RefreshMarkers();
+	Chat("$0cfShuffle! $fffAll checkpoints just teleported.");
+}
+
+// ---------------------------------- //
+// 4. Proximity claims: first spawned player inside the radius takes it
 declare K_ChaosCP[] RemainingCPs;
 declare NbClaimed = 0;
 foreach (CP in G_ActiveCPs) {
@@ -453,13 +592,56 @@ foreach (CP in G_ActiveCPs) {
 	}
 
 	// Claimed!
-	AddRoundPoints(Claimer.Score, CP.Points);
+	declare Login = Claimer.User.Login;
+	declare Points = CP.Points;
 	NbClaimed += 1;
+
+	// Optional: first-claim bonus
+	if (!G_FirstClaimDone) {
+		G_FirstClaimDone = True;
+		if (S_FirstClaimBonus > 0) {
+			Points += ML::Max(S_FirstClaimBonus, 0);
+			Chat("$0f0First blood! $<$fff" ^ Claimer.User.Name ^ "$> gets $0f0+" ^ S_FirstClaimBonus ^ "$fff bonus.");
+		}
+	}
+
+	// Optional: combo chains
+	if (S_ComboWindow > 0) {
+		if (G_LastClaimTime.existskey(Login) && Now - G_LastClaimTime[Login] <= S_ComboWindow * 1000) {
+			G_ComboCount[Login] = G_ComboCount[Login] + 1;
+			declare ComboBonus = ML::Min(G_ComboCount[Login] - 1, C_ComboMaxBonus);
+			Points += ComboBonus;
+			Announce("$f0fx" ^ G_ComboCount[Login] ^ " COMBO! $<$fff" ^ Claimer.User.Name ^ "$> $f0f+" ^ ComboBonus ^ " bonus");
+		} else {
+			G_ComboCount[Login] = 1;
+		}
+		G_LastClaimTime[Login] = Now;
+	}
+
+	AddRoundPoints(Claimer.Score, Points);
+
 	if (CP.IsGolden) {
-		Announce("$fd0★ $<$fff" ^ Claimer.User.Name ^ "$> grabbed a GOLDEN checkpoint! $fd0+" ^ CP.Points);
-		Chat("$fd0★ $<$fff" ^ Claimer.User.Name ^ "$> claimed a golden checkpoint! $fd0+" ^ CP.Points ^ "$fff (" ^ GetRoundPoints(Claimer.Score) ^ " pts)");
+		Announce("$fd0★ $<$fff" ^ Claimer.User.Name ^ "$> grabbed a GOLDEN checkpoint! $fd0+" ^ Points);
+		Chat("$fd0★ $<$fff" ^ Claimer.User.Name ^ "$> claimed a golden checkpoint! $fd0+" ^ Points ^ "$fff (" ^ GetRoundPoints(Claimer.Score) ^ " pts)");
 	} else {
-		Chat("$0cf◆ $<$fff" ^ Claimer.User.Name ^ "$> claimed a checkpoint! $0cf+" ^ CP.Points ^ "$fff (" ^ GetRoundPoints(Claimer.Score) ^ " pts)");
+		Chat("$0cf◆ $<$fff" ^ Claimer.User.Name ^ "$> claimed a checkpoint! $0cf+" ^ Points ^ "$fff (" ^ GetRoundPoints(Claimer.Score) ^ " pts)");
+	}
+
+	// Optional: golden checkpoints steal a point from the round leader
+	if (CP.IsGolden && S_GoldenSteal) {
+		declare CSmScore Victim <=> Null;
+		declare VictimPoints = 0;
+		foreach (Score in Scores) {
+			if (Score == Claimer.Score) continue;
+			if (GetRoundPoints(Score) > VictimPoints) {
+				VictimPoints = GetRoundPoints(Score);
+				Victim <=> Score;
+			}
+		}
+		if (Victim != Null && VictimPoints > 0 && Victim.User != Null) {
+			SetRoundPoints(Victim, VictimPoints - 1);
+			Chat("$f00⚔ $<$fff" ^ Claimer.User.Name ^ "$> stole a point from $<$fff" ^ Victim.User.Name ^ "$>!");
+		}
 	}
 
 	// Instant win condition
@@ -469,14 +651,20 @@ foreach (CP in G_ActiveCPs) {
 }
 if (NbClaimed > 0) {
 	G_ActiveCPs = RemainingCPs;
+
+	// Any claim during overtime is sudden death
+	if (G_InOvertime) {
+		G_RoundEndRequested = True;
+	}
 }
 
 // ---------------------------------- //
-// 3. Keep the configured number of chaos checkpoints alive
-if (G_ActiveCPs.count < GetNbChaosCheckpoints()) {
+// 5. Keep the configured number of chaos checkpoints alive
+//    (skipped in overtime: there is exactly one decider checkpoint)
+if (!G_InOvertime && G_ActiveCPs.count < GetNbChaosCheckpoints()) {
 	declare Missing = GetNbChaosCheckpoints() - G_ActiveCPs.count;
 	for (I, 1, Missing) {
-		SpawnChaosCP(-1);
+		SpawnChaosCP(-1, False);
 	}
 	RefreshMarkers();
 }
@@ -485,8 +673,26 @@ if (NbClaimed > 0) {
 }
 
 // ---------------------------------- //
-// 4. End of round: points limit reached or timer expired
-if (G_RoundEndRequested || Now >= G_RoundEndTime) {
+// 6. End of round: points limit, timer, or overtime resolution
+if (G_RoundEndRequested) {
+	MB_StopRound();
+} else if (!G_InOvertime && Now >= G_RoundEndTime) {
+	if (S_Overtime && IsRoundTied()) {
+		// Sudden death: one golden decider checkpoint, first claim wins
+		G_InOvertime = True;
+		G_FrenzyActive = False;
+		G_OvertimeEndTime = Now + C_OvertimeMaxMs;
+		G_ActiveCPs.clear();
+		SpawnChaosCP(-1, True);
+		RefreshMarkers();
+		RefreshHud();
+		SetHudEndTime(G_OvertimeEndTime);
+		Announce("$f00OVERTIME! $fffFirst checkpoint wins the round!");
+		Chat("$f00OVERTIME! $fffThe round is tied — first player to claim the golden checkpoint wins!");
+	} else {
+		MB_StopRound();
+	}
+} else if (G_InOvertime && Now >= G_OvertimeEndTime) {
 	MB_StopRound();
 }
 ***
@@ -502,7 +708,10 @@ foreach (Player in Players) {
 
 // Round winner = best round score
 declare Winner <=> GetRoundLeader();
-if (Winner != Null && Winner.User != Null) {
+if (Winner != Null && Winner.User != Null && IsRoundTied()) {
+	Announce("Round " ^ G_RoundNb ^ " ends in a draw!");
+	Chat("$f80Round " ^ G_RoundNb ^ " over — it's a draw, everyone keeps their points.");
+} else if (Winner != Null && Winner.User != Null) {
 	Announce("$<$fff" ^ Winner.User.Name ^ "$> wins round " ^ G_RoundNb ^ " with $ff0" ^ GetRoundPoints(Winner) ^ "$fff points!");
 	Chat("$0f0Round " ^ G_RoundNb ^ " over — $<$fff" ^ Winner.User.Name ^ "$> $0f0wins with $ff0" ^ GetRoundPoints(Winner) ^ "$0f0 points!");
 } else {
