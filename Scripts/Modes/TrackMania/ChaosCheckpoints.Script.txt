@@ -1,0 +1,542 @@
+/**
+ *	Chaos Checkpoints
+ *	----------------
+ *	A fast, free-roam Trackmania 2020 game mode.
+ *
+ *	- Players spawn at RANDOM landmarks of the map (starts / checkpoints).
+ *	- A set of "chaos checkpoints" (virtual, proximity-based) is active on
+ *	  the map at all times. Drive into one to claim it and score points.
+ *	- A claimed checkpoint instantly respawns somewhere else on the map.
+ *	- Some checkpoints are GOLDEN and worth 3 points instead of 1.
+ *	- First player to reach the points limit wins the round instantly.
+ *	  Otherwise the leader when the round timer runs out wins.
+ *	- Rounds are short by design: the time limit is clamped to 60-600s
+ *	  (default 480s = 8 minutes, hard max 10 minutes).
+ *	- The player with the most points after all rounds wins the map.
+ *
+ *	The chaos checkpoints are fully virtual: they reuse the positions of the
+ *	map's landmarks (checkpoints, starts, finish) as candidate locations, but
+ *	claiming is done by distance check, not by the map's race route. Any
+ *	regular TM_Race map with a decent number of checkpoints works.
+ */
+#Extends "Modes/Nadeo/Trackmania/Base/TrackmaniaBase.Script.txt"
+
+#Const CompatibleMapTypes "TrackMania\\TM_Race,TM_Race"
+#Const Version "1.0.0"
+#Const ScriptName "Modes/TrackMania/ChaosCheckpoints.Script.txt"
+
+#Include "MathLib" as ML
+#Include "TextLib" as TL
+
+// ---------------------------------- //
+// Settings
+// ---------------------------------- //
+#Setting S_RoundTimeLimit 480 as _("Round time limit in seconds (clamped to 60-600)")
+#Setting S_PointsLimit 15 as _("Points needed to instantly win a round (0 = timer only)")
+#Setting S_RoundsPerMap 2 as _("Rounds played on each map")
+#Setting S_NbChaosCheckpoints 3 as _("Chaos checkpoints active at the same time (1-8)")
+#Setting S_ClaimRadius 12.0 as _("Claim radius around a chaos checkpoint (meters)")
+#Setting S_GoldenChance 15 as _("Chance in % that a chaos checkpoint is golden (worth 3 points)")
+#Setting S_MinCheckpointDistance 60.0 as _("Preferred minimum distance between a new chaos checkpoint and all players (meters)")
+#Setting S_RandomPlayerSpawn True as _("Spawn and respawn players at random map landmarks")
+#Setting S_ChatMessages True as _("Announce claims and results in the chat")
+
+// ---------------------------------- //
+// Constants
+// ---------------------------------- //
+#Const C_PointsNormal 1				// Points for a regular chaos checkpoint
+#Const C_PointsGolden 3				// Points for a golden chaos checkpoint
+#Const C_SpawnCountdownMs 3000		// Countdown before players are released at round start
+#Const C_RespawnDelayMs 1500		// Delay before an unspawned player is thrown back in
+#Const C_EndRoundPauseMs 7000		// Pause between rounds to show the results
+#Const C_MaxPickTries 24			// Attempts when looking for a good checkpoint location
+#Const C_MarkerHeightOffset <0., 3., 0.>
+
+// ---------------------------------- //
+// Structures
+// ---------------------------------- //
+#Struct K_ChaosCP {
+	Integer LandmarkIndex;
+	Vec3 Position;
+	Integer Points;
+	Boolean IsGolden;
+}
+
+// ---------------------------------- //
+// Globals
+// ---------------------------------- //
+declare K_ChaosCP[] G_ActiveCPs;			// Currently claimable chaos checkpoints
+declare Integer[] G_CandidateLandmarks;		// Indexes into MapLandmarks usable as locations
+declare Integer G_RoundEndTime;				// Server time at which the round ends
+declare Integer G_RoundNb;					// Current round number on this map
+declare Integer[Text] G_RespawnAt;			// Login => time at which to respawn the player
+declare Boolean G_RoundEndRequested;		// A player reached the points limit
+declare CUILayer G_HudLayer;				// Custom HUD (timer + standings)
+
+// ---------------------------------- //
+// Small helpers around tunable settings
+// ---------------------------------- //
+Integer GetRoundTimeLimitMs() {
+	// Fast rounds by design: clamp between 1 and 10 minutes
+	return ML::Clamp(S_RoundTimeLimit, 60, 600) * 1000;
+}
+
+Integer GetNbChaosCheckpoints() {
+	return ML::Clamp(S_NbChaosCheckpoints, 1, 8);
+}
+
+// ---------------------------------- //
+/** Chat announcement (respects S_ChatMessages)
+ */
+Void Chat(Text _Message) {
+	if (!S_ChatMessages) return;
+	UIManager.UIAll.SendChat("$ff0⚡ $fff" ^ _Message);
+}
+
+// ---------------------------------- //
+/** Big on-screen announcement, always shown
+ */
+Void Announce(Text _Message) {
+	UIManager.UIAll.QueueMessage(3000, 1, CUIConfig::EMessageDisplay::Big, _Message);
+}
+
+// ---------------------------------- //
+// Score helpers
+//
+// All interactions with the Scores library are centralized here so the mode
+// is easy to adjust if the library API changes between script pack versions.
+// ---------------------------------- //
+Void ResetRoundPoints() {
+	foreach (Score in Scores) {
+		Scores::SetPlayerRoundPoints(Score, 0);
+	}
+}
+
+Void AddRoundPoints(CSmScore _Score, Integer _Points) {
+	if (_Score == Null) return;
+	Scores::AddPlayerRoundPoints(_Score, _Points);
+}
+
+Integer GetRoundPoints(CSmScore _Score) {
+	if (_Score == Null) return 0;
+	return Scores::GetPlayerRoundPoints(_Score);
+}
+
+Integer GetMatchPoints(CSmScore _Score) {
+	if (_Score == Null) return 0;
+	return Scores::GetPlayerMatchPoints(_Score);
+}
+
+// Move this round's points into the match total
+Void TransferRoundPointsToMatch() {
+	foreach (Score in Scores) {
+		Scores::AddPlayerMatchPoints(Score, Scores::GetPlayerRoundPoints(Score));
+		Scores::SetPlayerRoundPoints(Score, 0);
+	}
+}
+
+// ---------------------------------- //
+/** Best score of the round (Null if nobody scored)
+ */
+CSmScore GetRoundLeader() {
+	declare CSmScore Leader <=> Null;
+	declare LeaderPoints = 0;
+	foreach (Score in Scores) {
+		declare Points = GetRoundPoints(Score);
+		if (Points > LeaderPoints) {
+			LeaderPoints = Points;
+			Leader <=> Score;
+		}
+	}
+	return Leader;
+}
+
+CSmScore GetMatchLeader() {
+	declare CSmScore Leader <=> Null;
+	declare LeaderPoints = 0;
+	foreach (Score in Scores) {
+		declare Points = GetMatchPoints(Score);
+		if (Points > LeaderPoints) {
+			LeaderPoints = Points;
+			Leader <=> Score;
+		}
+	}
+	return Leader;
+}
+
+// ---------------------------------- //
+/** Collect the landmarks usable as spawn points and checkpoint locations
+ */
+Void BuildCandidateLandmarks() {
+	G_CandidateLandmarks.clear();
+	foreach (Index => Landmark in MapLandmarks) {
+		// Keep race waypoints (start, checkpoints, finish) and spawn blocks
+		if (Landmark.Waypoint == Null && Landmark.Tag != "Spawn") continue;
+		G_CandidateLandmarks.add(Index);
+	}
+
+	if (G_CandidateLandmarks.count < 4) {
+		Chat("$f80Warning: this map has very few landmarks ($fff" ^ G_CandidateLandmarks.count ^ "$f80). Chaos Checkpoints plays best on maps with many checkpoints!");
+	}
+}
+
+// ---------------------------------- //
+/** True if a chaos checkpoint currently sits on this landmark
+ */
+Boolean IsLandmarkUsed(Integer _LandmarkIndex) {
+	foreach (CP in G_ActiveCPs) {
+		if (CP.LandmarkIndex == _LandmarkIndex) return True;
+	}
+	return False;
+}
+
+// ---------------------------------- //
+/** Smallest distance from a position to any spawned player
+ */
+Real DistanceToClosestPlayer(Vec3 _Position) {
+	declare Closest = 999999.;
+	foreach (Player in Players) {
+		if (Player.SpawnStatus != CSmPlayer::ESpawnStatus::Spawned) continue;
+		declare Distance = ML::Distance(Player.Position, _Position);
+		if (Distance < Closest) Closest = Distance;
+	}
+	return Closest;
+}
+
+// ---------------------------------- //
+/** Spawn one new chaos checkpoint at a random free landmark.
+ *	Prefers locations at least S_MinCheckpointDistance away from every
+ *	player; falls back to the farthest candidate found.
+ */
+Void SpawnChaosCP(Integer _ExcludedLandmark) {
+	if (G_CandidateLandmarks.count <= 0) return;
+
+	declare BestIndex = -1;
+	declare BestDistance = -1.;
+	for (Try, 1, C_MaxPickTries) {
+		declare LandmarkIndex = G_CandidateLandmarks[ML::Rand(0, G_CandidateLandmarks.count - 1)];
+		if (LandmarkIndex == _ExcludedLandmark) continue;
+		if (IsLandmarkUsed(LandmarkIndex)) continue;
+		if (!MapLandmarks.existskey(LandmarkIndex)) continue;
+
+		declare Distance = DistanceToClosestPlayer(MapLandmarks[LandmarkIndex].Position);
+		if (Distance >= S_MinCheckpointDistance) {
+			BestIndex = LandmarkIndex;
+			break;
+		}
+		if (Distance > BestDistance) {
+			BestDistance = Distance;
+			BestIndex = LandmarkIndex;
+		}
+	}
+	if (BestIndex < 0 || !MapLandmarks.existskey(BestIndex)) return;
+
+	declare IsGolden = ML::Rand(1, 100) <= ML::Clamp(S_GoldenChance, 0, 100);
+	declare CP = K_ChaosCP {
+		LandmarkIndex = BestIndex,
+		Position = MapLandmarks[BestIndex].Position,
+		Points = C_PointsNormal,
+		IsGolden = IsGolden
+	};
+	if (IsGolden) CP.Points = C_PointsGolden;
+	G_ActiveCPs.add(CP);
+}
+
+// ---------------------------------- //
+/** Rebuild the 3D markers shown on every active chaos checkpoint
+ */
+Void RefreshMarkers() {
+	UIManager.UIAll.ClearMarkers();
+	foreach (CP in G_ActiveCPs) {
+		declare Marker = UIManager.UIAll.AddMarker(CP.Position + C_MarkerHeightOffset);
+		if (CP.IsGolden) {
+			Marker.Label = "$fd0★ +" ^ CP.Points;
+		} else {
+			Marker.Label = "$0cf◆ +" ^ CP.Points;
+		}
+		Marker.HudVisibility = CUIConfigMarker::EHudVisibility::Always;
+	}
+}
+
+// ---------------------------------- //
+// Custom HUD (top right): round timer, round/points info, standings.
+// Data is pushed through netwrite variables; the layout itself is static.
+// ---------------------------------- //
+Void SetHudEndTime(Integer _EndTime) {
+	declare netwrite Integer Net_ChaosCP_EndTime for Teams[0] = -1;
+	Net_ChaosCP_EndTime = _EndTime;
+}
+
+Void RefreshHud() {
+	declare netwrite Text Net_ChaosCP_Header for Teams[0] = "";
+	declare netwrite Text Net_ChaosCP_Standings for Teams[0] = "";
+
+	declare Header = "Round " ^ G_RoundNb ^ "/" ^ ML::Max(S_RoundsPerMap, 1);
+	if (S_PointsLimit > 0) Header ^= " · First to " ^ S_PointsLimit;
+	Net_ChaosCP_Header = Header;
+
+	// Sort players by (round + match) points, descending
+	declare Integer[Text] SortByLogin;
+	declare Text[Text] NameByLogin;
+	foreach (Score in Scores) {
+		if (Score.User == Null) continue;
+		SortByLogin[Score.User.Login] = -(GetRoundPoints(Score) + GetMatchPoints(Score));
+		NameByLogin[Score.User.Login] = Score.User.Name;
+	}
+	SortByLogin = SortByLogin.sort();
+
+	declare Standings = "";
+	declare Rank = 0;
+	foreach (Login => NegPoints in SortByLogin) {
+		Rank += 1;
+		if (Rank > 5) break;
+		declare Name = Login;
+		if (NameByLogin.existskey(Login)) Name = NameByLogin[Login];
+		Standings ^= Rank ^ ". $<$fff" ^ Name ^ "$> $ff0" ^ (-NegPoints) ^ "\n";
+	}
+	Net_ChaosCP_Standings = Standings;
+}
+
+Text GetHudManialink() {
+	return """
+<manialink version="3" name="ChaosCheckpoints_HUD">
+<frame pos="157 85">
+	<quad pos="2 3" size="56 42" halign="right" valign="top" bgcolor="000000" opacity="0.55"/>
+	<label pos="0 0" halign="right" textsize="5" textfont="GameFontExtraBold" textcolor="FFFFFF" id="Label_Timer" text="--:--"/>
+	<label pos="0 -9" halign="right" textsize="1.6" textcolor="FFCC00" id="Label_Header" text=""/>
+	<label pos="0 -14" halign="right" textsize="1.6" textcolor="FFFFFF" id="Label_Standings" text=""/>
+</frame>
+<script><!--
+#Include "TextLib" as TL
+#Include "MathLib" as ML
+
+main() {
+	wait(Teams.count > 0 && Page != Null);
+	declare Label_Timer <=> (Page.GetFirstChild("Label_Timer") as CMlLabel);
+	declare Label_Header <=> (Page.GetFirstChild("Label_Header") as CMlLabel);
+	declare Label_Standings <=> (Page.GetFirstChild("Label_Standings") as CMlLabel);
+
+	declare netread Integer Net_ChaosCP_EndTime for Teams[0] = -1;
+	declare netread Text Net_ChaosCP_Header for Teams[0] = "";
+	declare netread Text Net_ChaosCP_Standings for Teams[0] = "";
+
+	while (True) {
+		yield;
+		if (Net_ChaosCP_EndTime > 0) {
+			declare TimeLeft = ML::Max(0, Net_ChaosCP_EndTime - GameTime);
+			Label_Timer.Value = TL::TimeToText(TimeLeft, False);
+		} else {
+			Label_Timer.Value = "";
+		}
+		Label_Header.Value = Net_ChaosCP_Header;
+		Label_Standings.Value = Net_ChaosCP_Standings;
+	}
+}
+--></script>
+</manialink>
+""";
+}
+
+// ---------------------------------- //
+/** Spawn (or respawn) a player, at a random landmark when enabled.
+ *
+ *	Centralized here on purpose: this is the only place calling into the
+ *	Race library's spawn functions.
+ */
+Void ChaosSpawnPlayer(CSmPlayer _Player, Integer _StartTime) {
+	if (_Player == Null) return;
+
+	if (S_RandomPlayerSpawn && G_CandidateLandmarks.count > 0) {
+		// Try to pick a landmark that has no chaos checkpoint sitting on it,
+		// so nobody spawns straight into free points
+		declare PickedIndex = -1;
+		for (Try, 1, C_MaxPickTries) {
+			declare LandmarkIndex = G_CandidateLandmarks[ML::Rand(0, G_CandidateLandmarks.count - 1)];
+			PickedIndex = LandmarkIndex;
+			if (!IsLandmarkUsed(LandmarkIndex)) break;
+		}
+		if (PickedIndex >= 0 && MapLandmarks.existskey(PickedIndex)) {
+			declare Landmark <=> MapLandmarks[PickedIndex];
+			Race::Start(_Player, Landmark.Tag, Landmark.Order, _StartTime);
+			return;
+		}
+	}
+
+	// Fallback: regular spawn at the map start
+	Race::Start(_Player, _StartTime);
+}
+
+// ---------------------------------- //
+// Mode flow
+// ---------------------------------- //
+
+***Match_StartServer***
+***
+// Custom HUD layer, kept for the whole server lifetime
+G_HudLayer <=> UIManager.UILayerCreate();
+G_HudLayer.Type = CUILayer::EUILayerType::Normal;
+G_HudLayer.ManialinkPage = GetHudManialink();
+UIManager.UIAll.UILayers.add(G_HudLayer);
+SetHudEndTime(-1);
+***
+
+***Match_StartMap***
+***
+G_RoundNb = 0;
+G_ActiveCPs.clear();
+BuildCandidateLandmarks();
+Chat("$0cfChaos Checkpoints$fff — random spawns, grab the marked checkpoints, first to $ff0" ^ S_PointsLimit ^ "$fff points wins the round!");
+***
+
+***Match_StartRound***
+***
+G_RoundNb += 1;
+G_RoundEndRequested = False;
+G_ActiveCPs.clear();
+G_RespawnAt.clear();
+ResetRoundPoints();
+
+// Everyone spawns somewhere random, with a short countdown
+declare SpawnTime = Now + C_SpawnCountdownMs;
+foreach (Player in Players) {
+	ChaosSpawnPlayer(Player, SpawnTime);
+}
+
+// Round timer: default 8 minutes, never more than 10
+G_RoundEndTime = SpawnTime + GetRoundTimeLimitMs();
+SetHudEndTime(G_RoundEndTime);
+
+// Initial batch of chaos checkpoints
+for (I, 1, GetNbChaosCheckpoints()) {
+	SpawnChaosCP(-1);
+}
+RefreshMarkers();
+RefreshHud();
+
+Announce("Round " ^ G_RoundNb ^ " — GO!");
+Chat("Round $ff0" ^ G_RoundNb ^ "/" ^ ML::Max(S_RoundsPerMap, 1) ^ "$fff started — $ff0" ^ (GetRoundTimeLimitMs() / 60000) ^ "$fff minutes on the clock.");
+***
+
+***Match_PlayLoop***
+***
+// ---------------------------------- //
+// 1. Throw unspawned players back in (join, finish, give up, crash out).
+//    Giving up is a legit tactic: it rerolls your position.
+foreach (Player in Players) {
+	if (Player.SpawnStatus == CSmPlayer::ESpawnStatus::NotSpawned) {
+		declare Login = Player.User.Login;
+		if (!G_RespawnAt.existskey(Login)) {
+			G_RespawnAt[Login] = Now + C_RespawnDelayMs;
+		} else if (Now >= G_RespawnAt[Login]) {
+			declare Removed = G_RespawnAt.removekey(Login);
+			ChaosSpawnPlayer(Player, Now + 1000);
+		}
+	}
+}
+
+// ---------------------------------- //
+// 2. Proximity claims: first spawned player inside the radius takes it
+declare K_ChaosCP[] RemainingCPs;
+declare NbClaimed = 0;
+foreach (CP in G_ActiveCPs) {
+	declare CSmPlayer Claimer <=> Null;
+	foreach (Player in Players) {
+		if (Player.SpawnStatus != CSmPlayer::ESpawnStatus::Spawned) continue;
+		if (ML::Distance(Player.Position, CP.Position) <= ML::Max(S_ClaimRadius, 4.)) {
+			Claimer <=> Player;
+			break;
+		}
+	}
+	if (Claimer == Null) {
+		RemainingCPs.add(CP);
+		continue;
+	}
+
+	// Claimed!
+	AddRoundPoints(Claimer.Score, CP.Points);
+	NbClaimed += 1;
+	if (CP.IsGolden) {
+		Announce("$fd0★ $<$fff" ^ Claimer.User.Name ^ "$> grabbed a GOLDEN checkpoint! $fd0+" ^ CP.Points);
+		Chat("$fd0★ $<$fff" ^ Claimer.User.Name ^ "$> claimed a golden checkpoint! $fd0+" ^ CP.Points ^ "$fff (" ^ GetRoundPoints(Claimer.Score) ^ " pts)");
+	} else {
+		Chat("$0cf◆ $<$fff" ^ Claimer.User.Name ^ "$> claimed a checkpoint! $0cf+" ^ CP.Points ^ "$fff (" ^ GetRoundPoints(Claimer.Score) ^ " pts)");
+	}
+
+	// Instant win condition
+	if (S_PointsLimit > 0 && GetRoundPoints(Claimer.Score) >= S_PointsLimit) {
+		G_RoundEndRequested = True;
+	}
+}
+if (NbClaimed > 0) {
+	G_ActiveCPs = RemainingCPs;
+}
+
+// ---------------------------------- //
+// 3. Keep the configured number of chaos checkpoints alive
+if (G_ActiveCPs.count < GetNbChaosCheckpoints()) {
+	declare Missing = GetNbChaosCheckpoints() - G_ActiveCPs.count;
+	for (I, 1, Missing) {
+		SpawnChaosCP(-1);
+	}
+	RefreshMarkers();
+}
+if (NbClaimed > 0) {
+	RefreshHud();
+}
+
+// ---------------------------------- //
+// 4. End of round: points limit reached or timer expired
+if (G_RoundEndRequested || Now >= G_RoundEndTime) {
+	MB_StopRound();
+}
+***
+
+***Match_EndRound***
+***
+SetHudEndTime(-1);
+UIManager.UIAll.ClearMarkers();
+G_ActiveCPs.clear();
+foreach (Player in Players) {
+	UnspawnPlayer(Player);
+}
+
+// Round winner = best round score
+declare Winner <=> GetRoundLeader();
+if (Winner != Null && Winner.User != Null) {
+	Announce("$<$fff" ^ Winner.User.Name ^ "$> wins round " ^ G_RoundNb ^ " with $ff0" ^ GetRoundPoints(Winner) ^ "$fff points!");
+	Chat("$0f0Round " ^ G_RoundNb ^ " over — $<$fff" ^ Winner.User.Name ^ "$> $0f0wins with $ff0" ^ GetRoundPoints(Winner) ^ "$0f0 points!");
+} else {
+	Announce("Round " ^ G_RoundNb ^ " over — nobody scored!");
+	Chat("$f80Round " ^ G_RoundNb ^ " over — nobody scored a single point.");
+}
+
+TransferRoundPointsToMatch();
+RefreshHud();
+MB_Sleep(C_EndRoundPauseMs);
+
+if (G_RoundNb >= ML::Max(S_RoundsPerMap, 1)) {
+	MB_StopMap();
+}
+***
+
+***Match_EndMap***
+***
+SetHudEndTime(-1);
+UIManager.UIAll.ClearMarkers();
+
+declare Winner <=> GetMatchLeader();
+if (Winner != Null && Winner.User != Null) {
+	Announce("$<$fff" ^ Winner.User.Name ^ "$> wins the match with $ff0" ^ GetMatchPoints(Winner) ^ "$fff points!");
+	Chat("$0f0Match over — $<$fff" ^ Winner.User.Name ^ "$> $0f0takes it with $ff0" ^ GetMatchPoints(Winner) ^ "$0f0 points. GG!");
+} else {
+	Chat("$f80Match over — no winner this time.");
+}
+***
+
+***Match_EndServer***
+***
+if (G_HudLayer != Null) {
+	UIManager.UILayerDestroy(G_HudLayer);
+	G_HudLayer = Null;
+}
+***

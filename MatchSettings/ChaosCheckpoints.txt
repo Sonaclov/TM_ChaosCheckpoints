@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<playlist>
+	<gameinfos>
+		<game_mode>0</game_mode>
+		<script_name>Modes/TrackMania/ChaosCheckpoints.Script.txt</script_name>
+	</gameinfos>
+
+	<mode_script_settings>
+		<!-- Round length in seconds. Clamped by the mode to 60-600 (max 10 minutes). -->
+		<setting name="S_RoundTimeLimit" type="integer" value="480"/>
+		<!-- First player to reach this many points instantly wins the round. 0 = timer only. -->
+		<setting name="S_PointsLimit" type="integer" value="15"/>
+		<!-- Rounds played on each map before moving to the next one. -->
+		<setting name="S_RoundsPerMap" type="integer" value="2"/>
+		<!-- How many chaos checkpoints are claimable at the same time (1-8). -->
+		<setting name="S_NbChaosCheckpoints" type="integer" value="3"/>
+		<!-- Claim radius in meters around a chaos checkpoint. -->
+		<setting name="S_ClaimRadius" type="real" value="12.0"/>
+		<!-- Chance in % that a checkpoint is golden (worth 3 points). -->
+		<setting name="S_GoldenChance" type="integer" value="15"/>
+		<!-- Preferred minimum distance between a new checkpoint and every player. -->
+		<setting name="S_MinCheckpointDistance" type="real" value="60.0"/>
+		<!-- Spawn and respawn players at random landmarks of the map. -->
+		<setting name="S_RandomPlayerSpawn" type="boolean" value="1"/>
+		<!-- Announce claims and results in the chat. -->
+		<setting name="S_ChatMessages" type="boolean" value="1"/>
+	</mode_script_settings>
+
+	<startindex>0</startindex>
+
+	<!--
+		Add your maps below. Chaos Checkpoints plays best on open maps with
+		many checkpoints spread across the whole map.
+	-->
+	<map>
+		<file>MyMaps/MyChaosMap.Map.Gbx</file>
+	</map>
+</playlist>
