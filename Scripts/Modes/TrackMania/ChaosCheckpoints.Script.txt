@@ -164,7 +164,9 @@ G_ComboCount.clear();
 ResetRoundPoints();
 
 // Everyone spawns somewhere random, with a short countdown
+declare Integer G_RoundStartTime for This = 0;
 declare SpawnTime = Now + C_SpawnCountdownMs;
+G_RoundStartTime = SpawnTime;
 foreach (Player in Players) {
 	ChaosSpawnPlayer(Player, SpawnTime);
 }
@@ -186,6 +188,7 @@ for (I, 1, GetNbChaosCheckpoints()) {
 RefreshMarkers();
 RefreshHud();
 
+log("[ChaosCP] Round " ^ G_RoundNb ^ " started, Now=" ^ Now ^ " ends=" ^ G_RoundEndTime);
 Announce("Round " ^ G_RoundNb ^ " — GO!");
 Chat("Round $ff0" ^ G_RoundNb ^ "/" ^ ML::Max(S_RoundsPerMap, 1) ^ "$fff started — $ff0" ^ (GetRoundTimeLimitMs() / 60000) ^ "$fff minutes on the clock.");
 ***
@@ -215,6 +218,7 @@ foreach (Player in Players) {
 			G_RespawnAt[Login] = Now + C_RespawnDelayMs;
 		} else if (Now >= G_RespawnAt[Login]) {
 			declare Removed = G_RespawnAt.removekey(Login);
+			log("[ChaosCP] Respawning " ^ Login ^ " (was NotSpawned)");
 			ChaosSpawnPlayer(Player, Now + 1000);
 		}
 	}
@@ -256,9 +260,13 @@ if (G_NextShuffleTime > 0 && !G_InOvertime && Now >= G_NextShuffleTime) {
 // 4. Proximity claims: first spawned player inside the radius takes it
 declare K_ChaosCP[] RemainingCPs;
 declare NbClaimed = 0;
+declare Integer G_RoundStartTime for This = 0;
+// Grace period: claims are disabled during the spawn countdown
+declare ClaimsAllowed = Now >= G_RoundStartTime;
 foreach (CP in G_ActiveCPs) {
 	declare CSmPlayer Claimer <=> Null;
 	foreach (Player in Players) {
+		if (!ClaimsAllowed) break;
 		if (Player.SpawnStatus != CSmPlayer::ESpawnStatus::Spawned) continue;
 		if (ML::Distance(Player.Position, CP.Position) <= ML::Max(S_ClaimRadius, 4.)) {
 			Claimer <=> Player;
@@ -298,6 +306,7 @@ foreach (CP in G_ActiveCPs) {
 	}
 
 	AddRoundPoints(Claimer.Score, Points);
+	log("[ChaosCP] Claim by " ^ Login ^ " +" ^ Points ^ " => " ^ GetRoundPoints(Claimer.Score) ^ " pts, golden=" ^ CP.IsGolden);
 
 	if (CP.IsGolden) {
 		Announce("$fd0★ $<$fff" ^ Claimer.User.Name ^ "$> grabbed a GOLDEN checkpoint! $fd0+" ^ Points);
@@ -354,8 +363,10 @@ if (NbClaimed > 0) {
 // ---------------------------------- //
 // 6. End of round: points limit, timer, or overtime resolution
 if (G_RoundEndRequested) {
+	log("[ChaosCP] Round end: points limit reached or overtime decided");
 	MB_StopRound();
 } else if (!G_InOvertime && Now >= G_RoundEndTime) {
+	log("[ChaosCP] Round end: timer expired, Now=" ^ Now ^ " end=" ^ G_RoundEndTime);
 	if (S_Overtime && IsRoundTied()) {
 		// Sudden death: one golden decider checkpoint, first claim wins
 		G_InOvertime = True;
@@ -372,6 +383,7 @@ if (G_RoundEndRequested) {
 		MB_StopRound();
 	}
 } else if (G_InOvertime && Now >= G_OvertimeEndTime) {
+	log("[ChaosCP] Round end: overtime timed out");
 	MB_StopRound();
 }
 ***
@@ -567,13 +579,27 @@ Boolean IsRoundTied() {
  */
 Void BuildCandidateLandmarks() {
 	declare Integer[] G_CandidateLandmarks for This;
+	declare Integer[] G_SpawnLandmarks for This;
 	G_CandidateLandmarks.clear();
+	G_SpawnLandmarks.clear();
+	foreach (Index => Landmark in MapLandmarks) {
+		declare HasWP = Landmark.Waypoint != Null;
+		declare Fin = False;
+		if (HasWP) Fin = Landmark.Waypoint.IsFinish;
+		log("[ChaosCP] LM " ^ Index ^ " tag=" ^ Landmark.Tag ^ " order=" ^ Landmark.Order ^ " wp=" ^ HasWP ^ " fin=" ^ Fin ^ " pos=" ^ Landmark.Position);
+	}
 	foreach (Index => Landmark in MapLandmarks) {
 		// Keep race waypoints (start, checkpoints, finish) and spawn blocks
 		if (Landmark.Waypoint == Null && Landmark.Tag != "Spawn") continue;
 		G_CandidateLandmarks.add(Index);
+		// Spawning a player on a finish instantly ends their race (endless
+		// respawn loop), so finishes are chaos checkpoint locations only.
+		// Police Chase maps are mostly finish blocks ("Goal" landmarks).
+		if (Landmark.Waypoint != Null && Landmark.Waypoint.IsFinish && Landmark.Tag != "StartFinish") continue;
+		G_SpawnLandmarks.add(Index);
 	}
 
+	log("[ChaosCP] Landmarks: " ^ G_CandidateLandmarks.count ^ " checkpoint spots, " ^ G_SpawnLandmarks.count ^ " spawn spots, of " ^ MapLandmarks.count);
 	if (G_CandidateLandmarks.count < 4) {
 		Chat("$f80Warning: this map has very few landmarks ($fff" ^ G_CandidateLandmarks.count ^ "$f80). Chaos Checkpoints plays best on maps with many checkpoints!");
 	}
@@ -786,25 +812,27 @@ main() {
  *	Race library's spawn functions.
  */
 Void ChaosSpawnPlayer(CSmPlayer _Player, Integer _StartTime) {
-	declare Integer[] G_CandidateLandmarks for This;
+	declare Integer[] G_SpawnLandmarks for This;
 	if (_Player == Null) return;
 
-	if (S_RandomPlayerSpawn && G_CandidateLandmarks.count > 0) {
+	if (S_RandomPlayerSpawn && G_SpawnLandmarks.count > 0) {
 		// Try to pick a landmark that has no chaos checkpoint sitting on it,
 		// so nobody spawns straight into free points
 		declare PickedIndex = -1;
 		for (Try, 1, C_MaxPickTries) {
-			declare LandmarkIndex = G_CandidateLandmarks[ML::Rand(0, G_CandidateLandmarks.count - 1)];
+			declare LandmarkIndex = G_SpawnLandmarks[ML::Rand(0, G_SpawnLandmarks.count - 1)];
 			PickedIndex = LandmarkIndex;
 			if (!IsLandmarkUsed(LandmarkIndex)) break;
 		}
 		if (PickedIndex >= 0 && MapLandmarks.existskey(PickedIndex)) {
 			declare Landmark <=> MapLandmarks[PickedIndex];
+			log("[ChaosCP] Spawn " ^ _Player.User.Login ^ " at landmark " ^ PickedIndex ^ " tag=" ^ Landmark.Tag);
 			Race::Start(_Player, Landmark, _StartTime);
 			return;
 		}
 	}
 
 	// Fallback: regular spawn at the map start
+	log("[ChaosCP] Spawn " ^ _Player.User.Login ^ " at map start (fallback)");
 	Race::Start(_Player, _StartTime);
 }
