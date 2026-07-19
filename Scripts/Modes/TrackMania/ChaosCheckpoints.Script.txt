@@ -134,6 +134,12 @@ declare K_ChaosCP[] G_ActiveCPs for This;
 
 G_RoundNb = 0;
 G_ActiveCPs.clear();
+
+// New map, fresh scoreboard: points never carry over between maps
+foreach (Score in Scores) {
+	Scores::SetPlayerMatchPoints(Score, 0);
+	Scores::SetPlayerRoundPoints(Score, 0);
+}
 BuildCandidateLandmarks();
 Chat("$0cfChaos Checkpoints$fff — random spawns, grab the marked checkpoints, first to $ff0" ^ S_PointsLimit ^ "$fff points wins the round!");
 ***
@@ -591,7 +597,9 @@ Void BuildCandidateLandmarks() {
 	foreach (Index => Landmark in MapLandmarks) {
 		// Keep race waypoints (start, checkpoints, finish) and spawn blocks
 		if (Landmark.Waypoint == Null && Landmark.Tag != "Spawn") continue;
-		G_CandidateLandmarks.add(Index);
+		// Never place a chaos checkpoint on the StartFinish: it is the
+		// fallback spawn, and a checkpoint there means free points on spawn
+		if (Landmark.Tag != "StartFinish") G_CandidateLandmarks.add(Index);
 		// Spawning a player on a finish instantly ends their race (endless
 		// respawn loop), so finishes are chaos checkpoint locations only.
 		// Police Chase maps are mostly finish blocks ("Goal" landmarks).
@@ -652,6 +660,7 @@ Void SpawnChaosCP(Integer _ExcludedLandmark, Boolean _ForceGolden) {
 
 		declare Distance = DistanceToClosestPlayer(MapLandmarks[LandmarkIndex].Position);
 		if (Distance >= S_MinCheckpointDistance) {
+			BestDistance = Distance;
 			BestIndex = LandmarkIndex;
 			break;
 		}
@@ -661,6 +670,9 @@ Void SpawnChaosCP(Integer _ExcludedLandmark, Boolean _ForceGolden) {
 		}
 	}
 	if (BestIndex < 0 || !MapLandmarks.existskey(BestIndex)) return;
+	// Hard floor: never materialize a checkpoint within grabbing range of a
+	// player — on tiny maps it would be claimed the same tick, in a loop
+	if (BestDistance < ML::Max(S_ClaimRadius, 4.) * 2.) return;
 
 	declare IsGolden = _ForceGolden || G_FrenzyActive || ML::Rand(1, 100) <= ML::Clamp(S_GoldenChance, 0, 100);
 	declare CP = K_ChaosCP {
@@ -824,7 +836,7 @@ Void ChaosSpawnPlayer(CSmPlayer _Player, Integer _StartTime) {
 			PickedIndex = LandmarkIndex;
 			if (!IsLandmarkUsed(LandmarkIndex)) break;
 		}
-		if (PickedIndex >= 0 && MapLandmarks.existskey(PickedIndex)) {
+		if (PickedIndex >= 0 && MapLandmarks.existskey(PickedIndex) && !IsLandmarkUsed(PickedIndex)) {
 			declare Landmark <=> MapLandmarks[PickedIndex];
 			log("[ChaosCP] Spawn " ^ _Player.User.Login ^ " at landmark " ^ PickedIndex ^ " tag=" ^ Landmark.Tag);
 			Race::Start(_Player, Landmark, _StartTime);
